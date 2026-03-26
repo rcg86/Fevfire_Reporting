@@ -1,0 +1,39 @@
+# Central Block Run Fire Configuration
+# Default values for block run execution
+# Command-line arguments override these values
+
+# Default run type
+type: "rtl_syn"
+
+# Run type specific configurations
+rtl_syn:
+  location: "/proj/pd/rel/skylp/syn/logical"
+  #location: "/proj/pd/work/hitesh/pdrel/skylp/"
+  run_location: "/proj/work/ramapriya/skylp/runs/upfAutoRuns/fv/allFevBlockRuns"
+  read_upf: true
+  # Golden releases location for tag-based flist generation
+  golden_releases_location: "/proj/rel/GOLDEN_RELEASES"
+  golden_upf_location : "/proj/work/ramapriya/UPFRelease/latest/"
+  # Default block name for tag-based generation (e.g., SKYLP)
+  golden_release_block: "SKYLP"
+
+rtl_rtl:
+  location: "/proj/work/release/rtl"
+  run_location: "/proj/work/ramapriya/skylp/runs/upfAutoRuns/fv/rtl_rtl_auto"
+  read_upf: false
+  rtl_rtl_do: "rtl_rtl.do"
+  # Golden releases location for tag-based flist generation
+  golden_releases_location: "/proj/rel/GOLDEN_RELEASES"
+  golden_upf_location : "/proj/work/ramapriya/UPFRelease/latest/"
+  # Default block name for tag-based generation (e.g., SKYLP_G0657)
+  golden_release_block: "SKYLP"
+
+syn_pnr:
+  location: "/proj/pd/rel/skylp/pnr"
+  run_location: "/proj/work/ramapriya/skylp/runs/upfAutoRuns/fv/test"
+  read_upf: false
+  # Golden releases location for tag-based flist generation
+  golden_releases_location: "/proj/rel/GOLDEN_RELEASES"
+  golden_upf_location : "/proj/work/ramapriya/UPFRelease/latest/"
+  # Default block name for tag-based generation (e.g., SKYLP)
+  golden_release_block: "SKYLP"

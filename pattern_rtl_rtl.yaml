@@ -1,0 +1,105 @@
+# Pattern Configuration for FEV Report Generation
+# This file defines patterns to extract and patterns to ignore
+
+# ─── Log File Selection ─────────────────────────────────────────────────────
+# List the log files to scan. Paths are relative to run_location (the parent
+# directory of block_dir). Variables ${block} and ${block_name} expand to the
+# block name.  Glob wildcards (* and ?) are supported; when multiple files
+# match the most-recently modified one is used.
+#
+# Optional dict form lets you set an explicit label (used as the section title
+# in the HTML report):
+#   - pattern: "${block}/${block}_lec_*.log"
+#     label: lec_main
+#
+# If 'files' is omitted the script falls back to hardcoded defaults.
+files:
+  - "${block}/${block}_*.log"
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Error patterns - Lines matching these will be flagged as errors (RED)
+error_patterns:
+  - '//\s+Error:'
+  - 'ERROR'
+  - 'parse error'
+  - 'FAILED'
+  - 'FATAL'
+  - 'Comparison\s+FAILED'
+
+# Warning patterns - Lines matching these will be flagged as warnings (ORANGE)
+warning_patterns:
+  - 'WARNING'
+  - 'Warning:'
+  - 'WARN'
+
+# Info patterns - Lines matching these will be flagged as info (YELLOW)
+info_patterns:
+  - 'INFO:'
+  - 'Module Comparison Results'
+  - 'Equivalent\s+\d+$'
+  - 'Hierarchical compare :'
+  - 'Mapped points: SYSTEM class'
+  - 'Mapped points\s+PI\s+PO\s+BBOX\s+Total'
+  - 'Golden\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)'
+  - 'Revised\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)'
+  - 'Mapped points: USER class'
+  - 'Mapped points\s+DFF\s+DLAT\s+BBOX\s+Total'
+  - 'Golden\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)'
+  - 'Revised\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)'
+
+# Ignore error patterns - Error lines matching these will be ignored
+ignore_error:
+  - 'Expected error'
+  - 'Debug:.*error'
+  - '//\s+puts\s+\"//\s+Error:'
+  - '//\s+puts'
+
+# Ignore warning patterns - Warning lines matching these will be ignored
+ignore_warning:
+  - 'Expected warning'
+  - 'Debug:.*warning'
+  - 'Warning: This version is \d+ days old.'
+  - 'Warning: (RTL9.17) Cell'
+  - 'RTL1.5e'
+  - 'Warning: Shifting'
+  - 'RTL7.32a'
+  - '\(lhs\) variable'
+  - 'Warning: Cannot prove pin .* to be constant 0'
+
+# Ignore info patterns - Info lines matching these will be ignored
+ignore_info:
+  - 'Verbose:'
+report_patterns:
+  - name: 'status'
+    pattern: 'Compare (Results):\s+(\S+):(\S+)'
+    title_format: '{occurrence} Status: {group3}'
+    color_rules:
+      - condition: 'group3 == "NONEQ"'
+        color: 'green'
+      - condition: 'group1 != "Equivalent"'
+        color: 'red'
+      
+  - name: 'Verif'
+    pattern: 'Tri-stated output:\s+(\S+)'
+    title_format: '{occurrence} Tri_stated checked ? : {group1}' 
+    color_rules:
+      - condition: 'group1 == "checked"'
+        color: 'green'
+      - condition: 'group1 != "checked"'
+        color: 'red'
+
+  - name: 'module'
+    pattern: 'Processed\s+(\d+)\s+out\s+of\s+(\d+)\s+module pairs\s+EQ:\s+(\d+)\s+NEQ:\s+(\d+)\s+ABORT:\s+(\d+)'
+    title_format: '{occurrence} module status :\nProcessed {group1}/{group2}\n
+                        EQ: {group3}\nNONEQ: {group4}\n
+                        ABORT: {group5}' 
+    color_rules:
+      - condition: 'group4 > 0 or group5 > 0'
+        color: 'red'
+      - condition: 'group4 == 0 and group5 == 0'
+        color: 'green'
+       
+
+        
+        
+     

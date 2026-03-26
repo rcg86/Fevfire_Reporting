@@ -1,0 +1,185 @@
+# Pattern Configuration for FEV Report Generation
+# This file defines patterns to extract and patterns to ignore
+
+# ─── Log File Selection ─────────────────────────────────────────────────────
+# List the log files to scan. Paths are relative to run_location (the parent
+# directory of block_dir). Variables ${block} and ${block_name} expand to the
+# block name.  Glob wildcards (* and ?) are supported; when multiple files
+# match the most-recently modified one is used.
+#
+# Optional dict form lets you set an explicit label (used as the section title
+# in the HTML report):
+#   - pattern: "${block}/${block}_lec_*.log"
+#     label: lec_main
+#
+# If 'files' is omitted the script falls back to hardcoded defaults.
+files:
+  - "${block}/${block}_lec_*.log"
+  - "${block}/fv/${block}/rtl_to_fv_map.log"
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Error patterns - Lines matching these will be flagged as errors (RED)
+error_patterns:
+  - '//\s+Error:'
+  - 'ERROR'
+  - 'parse error'
+  - 'FAILED'
+  - 'FATAL'
+  - 'Comparison\s+FAILED'
+
+# Warning patterns - Lines matching these will be flagged as warnings (ORANGE)
+warning_patterns:
+  - 'WARNING'
+  - 'Warning:'
+  - 'WARN'
+
+# Info patterns - Lines matching these will be flagged as info (YELLOW)
+info_patterns:
+  - 'INFO:'
+  - 'Module Comparison Results'
+  - 'Equivalent\s+\d+$'
+  - 'Hierarchical compare :'
+  - 'Mapped points: SYSTEM class'
+  - 'Mapped points\s+PI\s+PO\s+BBOX\s+Total'
+  - 'Golden\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)'
+  - 'Revised\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)'
+  - 'Mapped points: USER class'
+  - 'Mapped points\s+DFF\s+DLAT\s+BBOX\s+Total'
+  - 'Golden\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)'
+  - 'Revised\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)'
+
+# Ignore error patterns - Error lines matching these will be ignored
+ignore_error:
+  - 'Expected error'
+  - 'Debug:.*error'
+  - '//\s+puts\s+\"//\s+Error:'
+  - '//\s+puts'
+
+# Ignore warning patterns - Warning lines matching these will be ignored
+ignore_warning:
+  - 'Expected warning'
+  - 'Debug:.*warning'
+  - 'Warning: This version is \d+ days old.'
+  - 'Warning: (RTL9.17) Cell'
+  - 'RTL1.5e'
+  - 'Warning: Shifting'
+  - 'RTL7.32a'
+  - '\(lhs\) variable'
+  - 'Warning: Cannot prove pin .* to be constant 0'
+
+# Ignore info patterns - Info lines matching these will be ignored
+ignore_info:
+  - 'Verbose:'
+
+# Report patterns - Multi-line patterns to extract and display as structured reports
+#
+# Required fields per entry:
+#   name:         Display name for the report section.
+#   pattern:      Python regex (re.DOTALL) matched against the full log content.
+#
+# Optional fields:
+#   subpatterns:  List of child pattern dicts, each with its own 'pattern' key and
+#                 optionally another 'subpatterns' list for deeper nesting.
+#                 Each child is applied only against the text matched by its parent
+#                 (strict scoping — never leaks outside the parent match).
+#                 A non-matching child degrades silently: all its groupN attrs → ''.
+#                 Children are referenced as pattern1, pattern2, ... (1-indexed by
+#                 position in the list).
+#
+#   title_format: Python format string for the occurrence title.
+#                 Available variables:
+#                   {occurrence}               - match number (1-based)
+#                   {group1}, {group2}, ...    - main pattern capture groups
+#                   {pattern1.group1}          - 1st child's group 1
+#                   {pattern2.group1}          - 2nd child's group 1
+#                   {pattern1.pattern1.group1} - 1st child's 1st grandchild's group 1
+#                 Escape sequences (use in single-quoted YAML strings):
+#                   \n  → line break         (new row in HTML)
+#                   \t  → tab stop           (&emsp;, ≈ one tab width — spacing is NOT column-aligned)
+#                   \|  → column separator   renders the row as a <table> cell;
+#                          every value on that row is placed in its own equal-width column,
+#                          giving SYMMETRICAL alignment regardless of label length.
+#                          Example: 'Golden: {group1}\|Revised: {group2}\|EQ: {group5}'
+#                          renders three perfectly aligned side-by-side cells.
+#                 Conditional block: {?key|content} collapses to '' when key is empty.
+#
+#   color_rules:  List of {condition, color} dicts evaluated top-to-bottom.
+#                 condition: Python expression using:
+#                   group1, group2, ...        - main pattern groups
+#                   pattern1.group1, ...       - child pattern groups
+#                   pattern1.pattern1.group1   - grandchild pattern groups
+#                 color: CSS color string. First truthy condition wins.
+report_patterns:
+  - name: 'status'
+    pattern: 'Hierarchical compare : (\S+)'
+    title_format: '{occurrence} Status: {group1}'
+    color_rules:
+      - condition: 'group1 == "Equivalent"'
+        color: 'green'
+      - condition: 'group1 != "Equivalent"'
+        color: 'red'
+  
+  - name: 'Overview'
+    pattern: 'Running Module (\S+) and (\S+).*?Processed (\d+) out of (\d+) module pairs\s+EQ: (\d+)\s+NEQ: (\d+)\s+ABORT: (\d+)'
+    subpatterns:
+      # pattern1 — applied to the main match text only
+      - pattern: 'EQ:\s+(\d+)\s+NEQ:\s+(\d+)\s+ABORT:\s+(\d+)'
+      # pattern2 — optional; degrades silently when absent from the match text
+      - pattern: 'Processed\s+(\d+)\s+out of\s+(\d+)'
+      # pattern3 — deeper nesting example: no grandchildren needed here
+      - pattern: 'report_unmapped_points\s+-summary.*?report_unmapped_points\s+-notmapped'
+        subpatterns:
+          - pattern: 'Golden:.*?Unreachable(?:\s+\d+)+\s+(\d+)'
+          - pattern: 'Revised:.*?Unreachable(?:\s+\d+)+\s+(\d+)'
+          - pattern: 'Golden:.*?Not-mapped(?:\s+\d+)+\s+(\d+)'
+          - pattern: 'Revised:.*?Not-mapped(?:\s+\d+)+\s+(\d+)'
+
+      - pattern: 'compare -noneq_stop 1.*?Memory usage'
+        subpatterns:
+          - pattern: 'Equivalent(?:\s+\d+)+\s+(\d+)'
+          - pattern: 'Inverted-equivalent(?:\s+\d+)+\s+(\d+)'
+          - pattern: 'Non-equivalent(?:\s+\d+)+\s+(\d+)'
+          - pattern: 'Not-compared(?:\s+\d+)+\s+(\d+)'          
+      - pattern: 'Command: compare -threads 1,4.*?Compare results of merged compare points'
+        subpatterns:
+          - pattern: 'Equivalent(?:\s+\d+)+\s+(\d+)'
+          - pattern: 'Non-equivalent(?:\s+\d+)+\s+(\d+)'
+          - pattern: 'Abort(?:\s+\d+)+\s+(\d+)'
+    title_format: '{occurrence}/{group4} 
+                    \n\|Golden: {group1}\|Revised: {group2}\n 
+                    Unreachable \|{pattern3.pattern1.group1}\|{pattern3.pattern2.group1}\n
+                    Unmapped \|{pattern3.pattern3.group1}\|{pattern3.pattern4.group1}\n
+                    Equivalent\|{pattern4.pattern1.group1}\n
+                    Inverted-Equivalent\|{pattern4.pattern2.group1}\n
+                    Not-Compared\|{pattern4.pattern4.group1}\n
+                    Non-Equivalent\|{pattern4.pattern3.group1}\n
+                    Compare Equivalent \|{pattern5.pattern1.group1}\n
+                    Compare Non-equivalent\|{pattern5.pattern2.group1}\n
+                    Compare Abort\|{pattern5.pattern3.group1}\n
+                    No of EQ modules\|{group5} \n 
+                    No of NONEQ modules\|{group6} \n 
+                    No of ABORT modules\|{group7}\n'
+    color_rules:
+      - condition: 'pattern5.pattern2.group1 > 0 or pattern5.pattern3.group1 > 0'
+        color: 'red'
+      - condition: 'group6 != prev_group6 and prev_group6 is not None and prev_group6 != ""'
+        color: 'orange'
+      - condition: 'group7 != prev_group7 and prev_group7 is not None and prev_group7 != ""'
+        color: 'orange'
+      - condition: 'pattern5.pattern2.group1 == "" and pattern5.pattern3.group1 == ""'
+        color: 'green'
+      - condition: 'True'
+        color: 'yellow'
+      - condition: 'pattern3.pattern4.group1 > 0'
+        color: 'pink'
+  - name: 'data_csv1'
+    pattern: 'EQ:\s+(\d+)\s+NEQ:\s+(\d+)\s+ABORT:\s+(\d+)'
+  - name: 'data_csv2'
+    pattern: 'read_design.*-golden.*-f\s+(\S+)'
+  - name: 'data_csv3'
+    pattern: 'read_design\s+-verilog95\s+-revised\s+-lastmod\s+-noelab (\S+)'
+  - name: 'data_csv4'
+    pattern: 'Verification information is set to (\S+)'
+  - csv: 'status.csv'
+    cols: block_name, hier_name, status,run_type, run_status,modules pass, module noneq, module abort, golden netlist, revised netlist, run_location, fv source location
+    data: block_name, hier_name, status.group1,info.yaml(run_type), info.yaml(status),data_csv1.group1, data_csv1.group2, data_csv1.group3, data_csv2.group1, data_csv3.group1, data_csv4.group1, info.yaml(fv_source_location)

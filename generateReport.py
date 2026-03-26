@@ -1,0 +1,2389 @@
+#!/usr/bin/env python3
+"""
+generateReport.py
+
+Extracts data from block-level FEV runs and generates HTML and CSV reports.
+Scans log files for errors, warnings, and info patterns and color-codes results.
+
+Usage:
+  python3 generateReport.py --run_location <path> [--output <html_file>]
+"""
+
+import os
+import sys
+import argparse
+import re
+import glob
+import yaml
+import csv
+import copy
+from datetime import datetime
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Hardcoded path to the full-chip instance-hierarchy YAML (skylp schema)
+# ---------------------------------------------------------------------------
+CHIP_SCHEMA = "/proj/pd/work/hitesh/REL/SKYLP/SCRIPTS/v21.03.2026/skylp_synth_data_roll_up/skylp.config.yaml"
+
+
+class PatternNode:
+    """Holds capture groups from a pattern match and optional child pattern nodes.
+
+    Attributes are named ``group1``, ``group2``, ... (int when numeric, str
+    otherwise) and ``matched`` (bool).  Child sub-patterns from the
+    ``subpatterns`` YAML list are accessible as ``pattern1``, ``pattern2``, ...
+    attributes — each is itself a PatternNode, enabling arbitrary nesting.
+
+    Designed as a format object so that Python's str.format() attribute-access
+    syntax works naturally::
+
+        {pattern1.group1}
+        {pattern1.pattern1.group2}
+        {pattern2.pattern1.pattern1.group3}
+    """
+
+    def __init__(self):
+        self.matched = False
+
+    @classmethod
+    def from_match(cls, m, children=None):
+        """Build from a successful re.Match object.
+
+        Parameters
+        ----------
+        m : re.Match
+            Successful match object.
+        children : dict[str, PatternNode], optional
+            Map of ``'pattern1'``, ``'pattern2'``, ... to child PatternNode
+            instances produced by recursively applying ``subpatterns``.
+        """
+        obj = cls()
+        obj.matched = True
+        for gi, gval in enumerate(m.groups(), 1):
+            if gval is not None:
+                try:
+                    setattr(obj, f'group{gi}', int(gval))
+                except (ValueError, TypeError):
+                    setattr(obj, f'group{gi}', gval)
+            else:
+                setattr(obj, f'group{gi}', '')
+        if children:
+            for cname, cnode in children.items():
+                setattr(obj, cname, cnode)
+        return obj
+
+    @classmethod
+    def empty(cls):
+        """Build a no-match placeholder — all groupN return '' and all patternN
+        return a nested empty PatternNode so deep references degrade silently."""
+        obj = cls()
+        obj.matched = False
+        return obj
+
+    def __getattr__(self, name):
+        """Safe fallback: groupN → '', patternN → empty PatternNode."""
+        if name.startswith('group'):
+            return ''
+        if name.startswith('pattern'):
+            # Build and cache an empty child node so repeated access is stable.
+            node = PatternNode.empty()
+            object.__setattr__(self, name, node)
+            return node
+        raise AttributeError(name)
+
+    def __repr__(self):
+        return f'PatternNode(matched={self.matched})'
+
+
+def _apply_pattern_hierarchy(subpatterns_yaml, text):
+    """Recursively apply a ``subpatterns`` YAML list against *text*.
+
+    Each list item corresponds to ``pattern1``, ``pattern2``, ... on the
+    result dict.  If an item itself contains a ``subpatterns`` key the same
+    function is called recursively with the child match text — enforcing strict
+    parent-scope matching at every level.
+
+    Parameters
+    ----------
+    subpatterns_yaml : list[dict]
+        Each dict must have a ``'pattern'`` key (regex string) and may have a
+        ``'subpatterns'`` key for deeper nesting.
+    text : str
+        The text to search within (parent ``match.group(0)`` for nested calls,
+        or the full log content for the root call).
+
+    Returns
+    -------
+    dict[str, PatternNode]
+        Maps ``'pattern1'``, ``'pattern2'``, ... to PatternNode instances.
+        Non-matching entries are empty PatternNodes so that deep references
+        like ``{pattern1.pattern1.group1}`` never raise an AttributeError.
+    """
+    result = {}
+    for idx, sp_entry in enumerate(subpatterns_yaml or [], 1):
+        key = f'pattern{idx}'
+        sp_regex = sp_entry.get('pattern') if isinstance(sp_entry, dict) else sp_entry
+        nested_yaml = sp_entry.get('subpatterns', []) if isinstance(sp_entry, dict) else []
+
+        if sp_regex:
+            m = re.search(sp_regex, text, re.DOTALL)
+            if m:
+                children = _apply_pattern_hierarchy(nested_yaml, m.group(0))
+                result[key] = PatternNode.from_match(m, children=children)
+            else:
+                # Not matched — still populate empty children for deep refs.
+                node = PatternNode.empty()
+                for cname, cnode in _apply_pattern_hierarchy(nested_yaml, '').items():
+                    setattr(node, cname, cnode)
+                result[key] = node
+        else:
+            result[key] = PatternNode.empty()
+    return result
+
+
+def _render_title_format(title_format, groups_dict, occurrence, sub_patterns=None):
+    """Render a title_format string with optional conditional block support.
+
+    Conditional syntax: ``{?groupN|content}``
+        - If groups_dict['groupN'] is non-None and non-empty the block is
+          replaced with *content* (which may itself contain {groupN} placeholders).
+        - Otherwise the whole block collapses to an empty string.
+
+    After conditional blocks are resolved, the remaining string is rendered
+    with Python's str.format() using the groups dict (None values are
+    replaced with '' so they don't appear as 'None' in the title).
+
+    Child pattern nodes (PatternNode) can be passed via *sub_patterns*, a dict
+    mapping ``'pattern1'``, ``'pattern2'``, ... to PatternNode instances built
+    by ``_apply_pattern_hierarchy()``.  These are merged directly into the
+    format dict so that ``{pattern1.group1}`` and ``{pattern1.pattern1.group2}``
+    resolve via Python's native attribute-access format syntax.
+    """
+    # --- Step 1: resolve conditional blocks {?groupN|content} ---
+    def _replace_cond(m):
+        key = m.group(1)
+        inner = m.group(2)
+        val = groups_dict.get(key)
+        if val is not None and val != '':
+            return inner
+        return ''
+
+    result = re.sub(
+        r'\{\?(\w+)\|((?:[^{}]|\{[^{}]+\})*)\}',
+        _replace_cond,
+        title_format,
+    )
+
+    # --- Step 2: standard .format() with None → '' ---
+    fmt_dict = {k: ('' if v is None else v) for k, v in groups_dict.items()}
+    fmt_dict['occurrence'] = occurrence
+    # Merge sub-pattern objects so {sub_pattern_1.group3} resolves via dot-access
+    if sub_patterns:
+        fmt_dict.update(sub_patterns)
+    return result.format(**fmt_dict)
+
+
+def _title_to_html(label):
+    """Convert a rendered title_format string to an HTML fragment.
+
+    Supported escape sequences (as written in single-quoted YAML strings,
+    where they arrive here as literal two-character sequences):
+
+    ``\\n``  – row break.  Each ``\\n`` starts a new line / table row.
+    ``\\t``  – tab stop (em-space).  Kept for simple alignment needs.
+    ``\\|``  – **column separator**.  When a row contains one or more ``\\|``
+             the whole title is rendered as a ``<table>`` so every ``\\|``-
+             separated cell gets an equal share of the available width,
+             giving *symmetrical* alignment regardless of label length.
+
+    Rows without ``\\|`` are rendered as plain ``<tr>`` full-width cells
+    (they still support ``\\t`` em-spaces if desired).
+    """
+    rows = label.split('\\n')
+    has_table = any('\\|' in row for row in rows)
+
+    if not has_table:
+        # Simple mode: no column separators — just replace escape sequences.
+        return label.replace('\\n', '<br>').replace('\\t', '&emsp;')
+
+    # Table mode: build an HTML table so columns align perfectly.
+    # Determine the maximum number of cells in any row to set colspan correctly.
+    max_cols = max((row.count('\\|') + 1) if '\\|' in row else 1 for row in rows)
+    table_style = 'border-collapse: collapse; line-height: 1.6; width: 100%;'
+    cell_style  = 'padding: 0 16px 0 0; white-space: nowrap; vertical-align: top;'
+    full_style  = f'padding: 0; white-space: nowrap; vertical-align: top;'
+
+    html_rows = []
+    for row in rows:
+        if '\\|' in row:
+            cells = row.split('\\|')
+            tds = ''.join(
+                f'<td style="{cell_style}">{c.strip().replace(chr(92) + "t", "&emsp;")}</td>'
+                for c in cells
+            )
+            html_rows.append(f'<tr>{tds}</tr>')
+        else:
+            plain = row.replace('\\t', '&emsp;')
+            html_rows.append(
+                f'<tr><td colspan="{max_cols}" style="{full_style}">{plain}</td></tr>'
+            )
+
+    inner = ''.join(html_rows)
+    return f'<table style="{table_style}">{inner}</table>'
+
+
+class LogAnalyzer:
+    """Analyzes log files for patterns and categorizes results."""
+    
+    def __init__(self, pattern_config=None):
+        # Define default patterns to search for
+        if pattern_config:
+            self.error_patterns = pattern_config.get('error_patterns', [])
+            self.warning_patterns = pattern_config.get('warning_patterns', [])
+            self.info_patterns = pattern_config.get('info_patterns', [])
+            self.ignore_error = pattern_config.get('ignore_error', [])
+            self.ignore_warning = pattern_config.get('ignore_warning', [])
+            self.ignore_info = pattern_config.get('ignore_info', [])
+            self.report_patterns = pattern_config.get('report_patterns', [])
+        else:
+            # Default patterns
+            self.error_patterns = [
+                r'\s+//\s+Error:',
+                r'\s+Missing:',
+                r'ERROR',
+                r'FAILED',
+                r'Abort'
+            ]
+            
+            self.warning_patterns = [
+                r'WARNING',
+                r'Warning:',
+                r'\s+//\s+Warning:'
+            ]
+            
+            self.info_patterns = [
+                r'INFO:',
+                r'Note:',
+                r'FYI'
+            ]
+            
+            # Separate ignore patterns for each category
+            self.ignore_error = []
+            self.ignore_warning = []
+            self.ignore_info = []
+            self.report_patterns = []
+    
+    def set_patterns(self, error_patterns=None, warning_patterns=None, info_patterns=None, 
+                     ignore_error=None, ignore_warning=None, ignore_info=None):
+        """Allow custom patterns to be set."""
+        if error_patterns:
+            self.error_patterns = error_patterns
+        if warning_patterns:
+            self.warning_patterns = warning_patterns
+        if info_patterns:
+            self.info_patterns = info_patterns
+        if ignore_error:
+            self.ignore_error = ignore_error
+        if ignore_warning:
+            self.ignore_warning = ignore_warning
+        if ignore_info:
+            self.ignore_info = ignore_info
+    
+    def should_ignore_error(self, line):
+        """Check if an error line should be ignored."""
+        for pattern in self.ignore_error:
+            if re.search(pattern, line):
+                # Uncomment for debugging:
+                # print(f"    [DEBUG] Ignoring error (matched '{pattern}'): {line.strip()[:80]}")
+                return True
+        return False
+    
+    def should_ignore_warning(self, line):
+        """Check if a warning line should be ignored."""
+        for pattern in self.ignore_warning:
+            if re.search(pattern, line):
+                return True
+        return False
+    
+    def should_ignore_info(self, line):
+        """Check if an info line should be ignored."""
+        for pattern in self.ignore_info:
+            if re.search(pattern, line):
+                return True
+        return False
+    
+    def analyze_file(self, file_path):
+        """
+        Analyze a single log file for patterns.
+        Returns dict with status and findings.
+        """
+        if not os.path.isfile(file_path):
+            return {
+                'status': 'missing',
+                'errors': [],
+                'warnings': [],
+                'infos': [],
+                'ignored_errors': [],
+                'ignored_warnings': [],
+                'ignored_infos': [],
+                'report_sections': [],
+                'exists': False
+            }
+        
+        errors = []
+        warnings = []
+        infos = []
+        ignored_errors = []
+        ignored_warnings = []
+        ignored_infos = []
+        report_sections = []
+        
+        try:
+            # Read entire file content for multi-line pattern matching
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                file_content = f.read()
+            
+            # Extract report sections using multi-line patterns
+            for report_pattern in self.report_patterns:
+                # Skip csv-directive entries (no 'pattern' key)
+                if isinstance(report_pattern, dict) and 'csv' in report_pattern:
+                    continue
+                pattern_str = report_pattern.get('pattern') if isinstance(report_pattern, dict) else report_pattern
+                if not pattern_str:
+                    continue
+                pattern_name = report_pattern.get('name', 'Report Section') if isinstance(report_pattern, dict) else 'Report Section'
+                title_format = report_pattern.get('title_format') if isinstance(report_pattern, dict) else None
+                color_rules = report_pattern.get('color_rules') if isinstance(report_pattern, dict) else None
+                
+                # Read hierarchical subpatterns list (new schema)
+                subpatterns_yaml = report_pattern.get('subpatterns', []) if isinstance(report_pattern, dict) else []
+
+                # Track previous occurrence's values so color_rules can reference prev_patternN.groupM
+                prev_sub_patterns = {}  # {'pattern1': PatternNode, ...} from previous match
+                prev_groups = {}        # {'group1': value, ...} from previous match
+
+                # Use finditer to find ALL occurrences, not just the first one (with DOTALL flag for multi-line matching)
+                for match_num, match in enumerate(re.finditer(pattern_str, file_content, re.DOTALL), 1):
+                    # Append occurrence number if more than one match found
+                    section_name = pattern_name if match_num == 1 else f"{pattern_name} (Occurrence {match_num})"
+                    
+                    # Extract capture groups and build groups dict (group1, group2, ...)
+                    groups_dict = {}
+                    if match.groups():
+                        for gi, gval in enumerate(match.groups(), 1):
+                            if gval is not None:
+                                try:
+                                    groups_dict[f'group{gi}'] = int(gval)
+                                except ValueError:
+                                    groups_dict[f'group{gi}'] = gval
+                            else:
+                                groups_dict[f'group{gi}'] = None
+
+                    # ---- Apply hierarchical subpatterns (scoped to main match text only) ----
+                    # Result: {'pattern1': PatternNode, 'pattern2': PatternNode, ...}
+                    match_text = match.group(0)
+                    sub_patterns_data = _apply_pattern_hierarchy(subpatterns_yaml, match_text)
+
+                    # Compute dynamic title from title_format if provided
+                    custom_title = None
+                    if title_format and groups_dict:
+                        try:
+                            custom_title = _render_title_format(title_format, groups_dict, match_num,
+                                                                sub_patterns=sub_patterns_data)
+                        except (KeyError, IndexError, ValueError) as e:
+                            custom_title = None  # Fall back to default
+                    
+                    # Evaluate color_rules if provided
+                    title_color = None
+                    if color_rules and groups_dict:
+                        safe_ns = {'__builtins__': {}, 'int': int, 'float': float, 'abs': abs, 'len': len, 'True': True, 'False': False, 'None': None}
+                        safe_ns.update(groups_dict)
+                        # Add PatternNode objects so conditions like pattern1.group2 work
+                        safe_ns.update(sub_patterns_data)
+                        # Inject previous occurrence values as prev_patternN / prev_groupN
+                        # so conditions like prev_pattern5.pattern2.group1 work via PatternNode dot-access
+                        for pkey, pnode in prev_sub_patterns.items():
+                            safe_ns[f'prev_{pkey}'] = pnode
+                        for gkey, gval in prev_groups.items():
+                            safe_ns[f'prev_{gkey}'] = gval
+                        for rule in color_rules:
+                            condition = rule.get('condition', 'False')
+                            try:
+                                if eval(condition, safe_ns):
+                                    title_color = rule.get('color')
+                                    break
+                            except Exception:
+                                continue
+
+                    # Save current occurrence as previous for the next iteration
+                    prev_sub_patterns = sub_patterns_data
+                    prev_groups = groups_dict
+                    
+                    # Calculate line numbers from character positions
+                    start_pos = match.start()
+                    end_pos = match.end()
+                    start_line = file_content[:start_pos].count('\n') + 1
+                    end_line = file_content[:end_pos].count('\n') + 1
+                    
+                    report_sections.append({
+                        'name': section_name,
+                        'content': match.group(0).strip(),
+                        'start_pos': start_pos,
+                        'end_pos': end_pos,
+                        'line_number': start_line,
+                        'end_line_number': end_line,
+                        'custom_title': custom_title,
+                        'title_color': title_color,
+                        'groups': groups_dict,
+                        'sub_patterns': sub_patterns_data,
+                        'has_title_format': title_format is not None,
+                    })
+            
+            # Line-by-line analysis for errors, warnings, infos
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                for line_num, line in enumerate(f, 1):
+                    # Check for errors
+                    error_matched = False
+                    for pattern in self.error_patterns:
+                        if re.search(pattern, line):
+                            # Check if this error should be ignored
+                            if not self.should_ignore_error(line):
+                                errors.append((line_num, line.strip()))
+                            else:
+                                ignored_errors.append((line_num, line.strip()))
+                            error_matched = True
+                            break
+                    
+                    if error_matched:
+                        continue
+                    
+                    # Check for warnings
+                    warning_matched = False
+                    for pattern in self.warning_patterns:
+                        if re.search(pattern, line):
+                            # Check if this warning should be ignored
+                            if not self.should_ignore_warning(line):
+                                warnings.append((line_num, line.strip()))
+                            else:
+                                ignored_warnings.append((line_num, line.strip()))
+                            warning_matched = True
+                            break
+                    
+                    if warning_matched:
+                        continue
+                    
+                    # Check for info
+                    for pattern in self.info_patterns:
+                        if re.search(pattern, line):
+                            # Check if this info should be ignored
+                            if not self.should_ignore_info(line):
+                                infos.append((line_num, line.strip()))
+                            else:
+                                ignored_infos.append((line_num, line.strip()))
+                            break
+        
+        except Exception as e:
+            return {
+                'status': 'error',
+                'errors': [(0, f"Failed to read file: {str(e)}")],
+                'warnings': [],
+                'infos': [],
+                'ignored_errors': [],
+                'ignored_warnings': [],
+                'ignored_infos': [],
+                'report_sections': [],
+                'exists': True
+            }
+        
+        # Determine overall status
+        if errors:
+            status = 'error'
+        elif warnings:
+            status = 'warning'
+        elif infos:
+            status = 'info'
+        else:
+            status = 'success'
+        
+        return {
+            'status': status,
+            'errors': errors,
+            'warnings': warnings,
+            'infos': infos,
+            'ignored_errors': ignored_errors,
+            'ignored_warnings': ignored_warnings,
+            'ignored_infos': ignored_infos,
+            'report_sections': report_sections,
+            'exists': True
+        }
+
+
+class BlockRunAnalyzer:
+    """Analyzes all log files for a block run."""
+    
+    def __init__(self, block_dir, block_name, global_pattern_config=None):
+        self.block_dir = block_dir
+        self.block_name = block_name
+        self.run_location = os.path.dirname(block_dir)  # parent dir of block_dir
+
+        # Load patterns (block-specific overrides global)
+        pattern_config = self.load_pattern_config(global_pattern_config)
+        self.file_patterns = pattern_config.get('files', [])  # list of glob pattern entries
+        self.analyzer = LogAnalyzer(pattern_config)
+    
+    def load_pattern_config(self, global_pattern_config=None):
+        """Load pattern configuration from YAML files."""
+        # Start with global config
+        if global_pattern_config:
+            pattern_config = {
+                'error_patterns': global_pattern_config.get('error_patterns', []).copy(),
+                'warning_patterns': global_pattern_config.get('warning_patterns', []).copy(),
+                'info_patterns': global_pattern_config.get('info_patterns', []).copy(),
+                'ignore_error': global_pattern_config.get('ignore_error', []).copy(),
+                'ignore_warning': global_pattern_config.get('ignore_warning', []).copy(),
+                'ignore_info': global_pattern_config.get('ignore_info', []).copy(),
+                'report_patterns': global_pattern_config.get('report_patterns', []).copy(),
+                'files': list(global_pattern_config.get('files', []))
+            }
+        else:
+            pattern_config = {
+                'error_patterns': [],
+                'warning_patterns': [],
+                'info_patterns': [],
+                'ignore_error': [],
+                'ignore_warning': [],
+                'ignore_info': [],
+                'report_patterns': [],
+                'files': []
+            }
+        
+        # Look for block-specific pattern file: <block_dir>/pattern.yaml
+        block_pattern_file = os.path.join(self.block_dir, 'pattern.yaml')
+        if os.path.isfile(block_pattern_file):
+            try:
+                with open(block_pattern_file, 'r') as f:
+                    block_config = yaml.safe_load(f) or {}
+                
+                print(f"  Loaded block-specific patterns from {block_pattern_file}")
+                
+                # Merge or override based on configuration
+                # If block config has patterns, they extend (not replace) global patterns
+                if 'error_patterns' in block_config:
+                    print(f"    Adding {len(block_config['error_patterns'])} block error patterns")
+                    pattern_config['error_patterns'].extend(block_config['error_patterns'])
+                if 'warning_patterns' in block_config:
+                    print(f"    Adding {len(block_config['warning_patterns'])} block warning patterns")
+                    pattern_config['warning_patterns'].extend(block_config['warning_patterns'])
+                if 'info_patterns' in block_config:
+                    print(f"    Adding {len(block_config['info_patterns'])} block info patterns")
+                    pattern_config['info_patterns'].extend(block_config['info_patterns'])
+                if 'report_patterns' in block_config:
+                    print(f"    Adding {len(block_config['report_patterns'])} block report patterns")
+                    pattern_config['report_patterns'].extend(block_config['report_patterns'])
+                if 'ignore_error' in block_config:
+                    print(f"    Adding {len(block_config['ignore_error'])} block ignore_error patterns")
+                    pattern_config['ignore_error'].extend(block_config['ignore_error'])
+                if 'ignore_warning' in block_config:
+                    print(f"    Adding {len(block_config['ignore_warning'])} block ignore_warning patterns")
+                    pattern_config['ignore_warning'].extend(block_config['ignore_warning'])
+                if 'ignore_info' in block_config:
+                    print(f"    Adding {len(block_config['ignore_info'])} block ignore_info patterns")
+                    pattern_config['ignore_info'].extend(block_config['ignore_info'])
+                
+            except Exception as e:
+                print(f"  Warning: Failed to read pattern file {block_pattern_file}: {e}")
+        else:
+            print(f"  No block-specific pattern file found at {block_pattern_file}")
+        
+        print(f"  Final pattern counts - Errors: {len(pattern_config['error_patterns'])}, Warnings: {len(pattern_config['warning_patterns'])}, Infos: {len(pattern_config['info_patterns'])}")
+        print(f"  Final ignore counts - ignore_error: {len(pattern_config['ignore_error'])}, ignore_warning: {len(pattern_config['ignore_warning'])}, ignore_info: {len(pattern_config['ignore_info'])}")
+        
+        return pattern_config
+    
+    def find_log_files(self):
+        """Find all relevant log files for this block.
+
+        If 'files' is defined in pattern.yaml, use those glob patterns.
+        Each entry can be:
+          - A plain string: "${block}/${block}_lec_.*.log"
+          - A dict:         {pattern: "${block}/${block}_lec_.*.log", label: lec_main}
+
+        Variables expanded: ${block} and ${block_name} -> block_name.
+        Patterns are relative to run_location (parent of block_dir).
+        When a wildcard matches multiple files the most-recently modified is used.
+        Falls back to hardcoded defaults when 'files' is not set.
+        """
+        log_files = {}
+
+        if self.file_patterns:
+            for entry in self.file_patterns:
+                if isinstance(entry, dict):
+                    pat = entry.get('pattern', '')
+                    label = entry.get('label', None)
+                else:
+                    pat = str(entry)
+                    label = None
+
+                # Expand ${block} and ${block_name}
+                expanded = pat.replace('${block_name}', self.block_name).replace('${block}', self.block_name)
+                full_pattern = os.path.join(self.run_location, expanded)
+                matches = sorted(glob.glob(full_pattern), key=os.path.getmtime, reverse=True)
+
+                if not matches:
+                    key = label if label else re.sub(r'[^\w]+', '_', os.path.splitext(os.path.basename(expanded))[0]).strip('_') or 'unknown'
+                    log_files[key] = None
+                    print(f"  files pattern '{pat}' -> no files found at {full_pattern}")
+                else:
+                    chosen = matches[0]
+                    key = label if label else re.sub(r'[^\w]+', '_', os.path.splitext(os.path.basename(chosen))[0]).strip('_') or 'unknown'
+                    # Avoid duplicate keys by appending a suffix
+                    orig_key = key
+                    idx = 1
+                    while key in log_files:
+                        key = f"{orig_key}_{idx}"
+                        idx += 1
+                    log_files[key] = chosen
+                    if len(matches) > 1:
+                        print(f"  files pattern '{pat}' -> {chosen} (most recent of {len(matches)})")
+                    else:
+                        print(f"  files pattern '{pat}' -> {chosen}")
+            return log_files
+
+        # ---- Hardcoded fallback defaults ----
+        # 1. fv/<block_name>/rtl_to_fv_map.log
+        fv_log = os.path.join(self.block_dir, 'fv', self.block_name, 'rtl_to_fv_map.log')
+        log_files['rtl_to_fv_map'] = fv_log
+        print(f"  Looking for rtl_to_fv_map.log at: {fv_log}")
+        if os.path.isfile(fv_log):
+            print(f" Found")
+        else:
+            print(f" Not found")
+
+        # 2. <block_name>_lec_<timestamp>.log
+        lec_logs = glob.glob(os.path.join(self.block_dir, f"{self.block_name}_lec_*.log"))
+        if lec_logs:
+            lec_logs.sort(key=os.path.getmtime, reverse=True)
+            log_files['lec_main'] = lec_logs[0]
+        else:
+            log_files['lec_main'] = None
+
+        # 3. <block_name>_auto_lec_<timestamp>-job-<job_id>.out
+        job_out_logs = glob.glob(os.path.join(self.block_dir, f"{self.block_name}_auto_lec_*-job-*.out"))
+        if job_out_logs:
+            job_out_logs.sort(key=os.path.getmtime, reverse=True)
+            log_files['job_out'] = job_out_logs[0]
+        else:
+            log_files['job_out'] = None
+
+        # 4. <block_name>_auto_lec_<timestamp>-job-<job_id>.err
+        job_err_logs = glob.glob(os.path.join(self.block_dir, f"{self.block_name}_auto_lec_*-job-*.err"))
+        if job_err_logs:
+            job_err_logs.sort(key=os.path.getmtime, reverse=True)
+            log_files['job_err'] = job_err_logs[0]
+        else:
+            log_files['job_err'] = None
+
+        return log_files
+    
+    def analyze(self):
+        """Analyze all log files and return results."""
+        log_files = self.find_log_files()
+        results = {}
+        
+        for log_type, log_path in log_files.items():
+            if log_path:
+                print(f"  Analyzing {log_type}: {log_path}")
+                results[log_type] = self.analyzer.analyze_file(log_path)
+                results[log_type]['path'] = log_path
+                print(f"    Status: {results[log_type]['status']}, Errors: {len(results[log_type]['errors'])}, Warnings: {len(results[log_type]['warnings'])}, Infos: {len(results[log_type]['infos'])}")
+            else:
+                results[log_type] = {
+                    'status': 'missing',
+                    'errors': [],
+                    'warnings': [],
+                    'infos': [],
+                    'exists': False,
+                    'path': None
+                }
+        
+        # Determine overall block status (worst status wins)
+        statuses = [r['status'] for r in results.values()]
+        if 'error' in statuses:
+            overall_status = 'error'
+        elif 'warning' in statuses:
+            overall_status = 'warning'
+        elif 'info' in statuses:
+            overall_status = 'info'
+        elif 'missing' in statuses:
+            overall_status = 'missing'
+        else:
+            overall_status = 'success'
+        
+        return {
+            'block_name': self.block_name,
+            'block_dir': self.block_dir,
+            'overall_status': overall_status,
+            'log_results': results
+        }
+
+
+class HTMLReportGenerator:
+    """Generates HTML report from analysis results."""
+    
+    STATUS_COLORS = {
+        'error':   '#ff4444',   # Red
+        'warning': '#ff9933',   # Orange
+        'info':    '#ffdd44',   # Yellow
+        'success': '#44cc44',   # Green
+        'missing': '#cccccc',   # Gray
+        'nodata':  '#aaaaaa',   # Light gray – no run data available
+    }
+
+    STATUS_LABELS = {
+        'error':   'ERROR',
+        'warning': 'WARNING',
+        'info':    'INFO',
+        'success': 'PASS',
+        'missing': 'MISSING',
+        'nodata':  'No Data',
+    }
+
+    # Rank used when aggregating child statuses up the hierarchy (highest = worst)
+    _STATUS_RANK = {'error': 4, 'warning': 3, 'info': 2, 'missing': 1, 'success': 0, 'nodata': -1}
+    
+    def __init__(self, output_file):
+        self.output_file = output_file
+    
+    def generate(self, block_results, chip_hierarchy=None):
+        """Generate HTML report from block analysis results.
+
+        When *chip_hierarchy* is supplied (a tuple returned by
+        ``load_chip_hierarchy``), the report is rendered as a collapsible
+        chip-level tree rather than a flat summary table.
+        """
+        html = self._generate_header()
+        html += '<div style="background:#fff8e1;border:1px solid #ffecb3;padding:8px 12px;border-radius:4px;margin:10px 0;">If clicking "Reports" or "Open Full Log" does nothing, open this HTML in a web browser (Chrome/Firefox). Some previewers block scripts and inline events.</div>'
+
+        # Prefer hierarchical chip view when a schema was loaded.
+        _chip_name = chip_hierarchy[0] if chip_hierarchy else None
+        _hierarchy = chip_hierarchy[1] if chip_hierarchy and len(chip_hierarchy) > 1 else None
+        if _chip_name and _hierarchy:
+            html += self._generate_hierarchical_view(block_results, _chip_name, _hierarchy)
+        else:
+            # (Per-section filter bars are embedded in each pattern section below)
+            html += self._generate_summary_table(block_results)
+            html += self._generate_detailed_sections(block_results)
+
+        html += self._generate_footer()
+        
+        with open(self.output_file, 'w') as f:
+            f.write(html)
+        
+        print(f"HTML report generated: {self.output_file}")
+        
+        # Also generate standalone log viewer HTML files
+        output_dir = os.path.join(os.path.dirname(self.output_file), 'block_html')
+        os.makedirs(output_dir, exist_ok=True)
+        for result in block_results:
+            block_name = result['block_name']
+            for log_type, log_result in result['log_results'].items():
+                if log_result.get('exists'):
+                    viewer_file = self._generate_log_viewer_html(log_result, block_name, log_type, output_dir)
+                    if viewer_file:
+                        print(f"Log viewer generated: {viewer_file}")
+    
+    def _generate_header(self):
+        """Generate HTML header with CSS."""
+        return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FEV Block Run Report</title>
+    <style>
+        body {{
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 20px;
+            background-color: #f5f5f5;
+        }}
+        h1 {{
+            color: #333;
+            border-bottom: 3px solid #007acc;
+            padding-bottom: 10px;
+        }}
+        h2 {{
+            color: #555;
+            margin-top: 30px;
+            border-bottom: 2px solid #ccc;
+            padding-bottom: 5px;
+        }}
+        h3 {{
+            color: #666;
+            margin-top: 20px;
+        }}
+        .timestamp {{
+            color: #888;
+            font-size: 0.9em;
+        }}
+        table {{
+            border-collapse: collapse;
+            width: 100%;
+            background-color: white;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }}
+        th {{
+            background-color: #007acc;
+            color: white;
+            padding: 12px;
+            text-align: left;
+            font-weight: bold;
+        }}
+        td {{
+            padding: 10px;
+            border-bottom: 1px solid #ddd;
+        }}
+        tr:hover {{
+            background-color: #f9f9f9;
+        }}
+        .status-cell {{
+            font-weight: bold;
+            text-align: center;
+            padding: 8px;
+            border-radius: 4px;
+        }}
+        .block-section {{
+            background-color: white;
+            padding: 20px;
+            margin-bottom: 20px;
+            border-radius: 5px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }}
+        .log-entry {{
+            font-family: 'Courier New', monospace;
+            font-size: 0.85em;
+            padding: 5px;
+            margin: 2px 0;
+            background-color: #f9f9f9;
+            border-left: 3px solid #ccc;
+            padding-left: 10px;
+        }}
+        .log-entry.error {{
+            border-left-color: #ff4444;
+            background-color: #ffeeee;
+        }}
+        .log-entry.warning {{
+            border-left-color: #ff9933;
+            background-color: #fff8ee;
+        }}
+        .log-entry.info {{
+            border-left-color: #ffdd44;
+            background-color: #fffcee;
+        }}
+        .line-number {{
+            color: #888;
+            margin-right: 10px;
+        }}
+        .collapsible {{
+            cursor: pointer;
+            padding: 10px;
+            background-color: #f0f0f0;
+            border: none;
+            text-align: left;
+            width: 100%;
+            font-weight: bold;
+            margin-top: 10px;
+            border: 1px solid #ccc;
+            border-radius: 3px;
+        }}
+        .collapsible:hover {{
+            background-color: #e0e0e0;
+        }}
+        .collapsible:active {{
+            background-color: #d0d0d0;
+        }}
+        .content {{
+            display: none;
+            padding: 10px;
+            background-color: #fafafa;
+            border: 1px solid #ddd;
+        }}
+        .tabs {{
+            margin: 10px 0 20px;
+        }}
+        .tab-buttons {{
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            margin-bottom: 8px;
+        }}
+        .tab-button {{
+            background-color: #eee;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            padding: 6px 10px;
+            cursor: pointer;
+        }}
+        .tab-button.active {{
+            background-color: #007acc;
+            color: white;
+            border-color: #007acc;
+        }}
+        .tab-close {{
+            margin-left: 8px;
+            color: inherit;
+            text-decoration: none;
+            cursor: pointer;
+        }}
+        .tab-panels .tab-panel {{
+            display: none;
+            background-color: white;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            padding: 10px;
+            font-family: 'Courier New', monospace;
+            font-size: 0.85em;
+            max-height: 600px;
+            overflow: auto;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }}
+        .tab-panels .tab-panel.active {{
+            display: block;
+        }}
+        .highlight {{
+            background-color: #fff59d; /* light yellow */
+            border-left: 3px solid #ffdd44;
+            padding-left: 6px;
+        }}
+        .log-viewer {{
+            background-color: white;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            padding: 10px;
+            font-family: 'Courier New', monospace;
+            font-size: 0.85em;
+            max-height: 500px;
+            overflow: auto;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            margin-top: 10px;
+        }}
+        .log-line {{
+            padding: 2px 8px;
+            margin: 0;
+            display: block;
+            line-height: 1.5;
+        }}
+        .log-line:target {{
+            background-color: #ffff99 !important;
+            border-left: 3px solid #ffdd44;
+            padding-left: 5px;
+        }}
+        .log-line-number {{
+            color: #888;
+            margin-right: 10px;
+            user-select: none;
+            display: inline-block;
+            min-width: 50px;
+            text-align: right;
+        }}
+        .log-line-content {{
+            display: inline;
+        }}
+        .log-line a {{
+            color: #007acc;
+            text-decoration: none;
+            cursor: pointer;
+            font-weight: bold;
+        }}
+        .log-line a:hover {{
+            text-decoration: underline;
+        }}
+        /* Pure CSS color filter — checkbox + label siblings */
+        input.cf {{ display: none; }}
+        label.cf-label {{ display:inline-flex;align-items:center;gap:4px;cursor:pointer;padding:4px 10px;margin:2px;border:2px solid #ccc;border-radius:4px;background:#f5f5f5;user-select:none;font-size:0.9em; }}
+        input.cf:checked + label.cf-label {{ border-color:#007acc; background:#e3f2fd; }}
+        input.cf[data-color="green"]:not(:checked) ~ .occ-wrap[data-color="green"] {{ display: none !important; }}
+        input.cf[data-color="orange"]:not(:checked) ~ .occ-wrap[data-color="orange"] {{ display: none !important; }}
+        input.cf[data-color="red"]:not(:checked) ~ .occ-wrap[data-color="red"] {{ display: none !important; }}
+        input.cf[data-color="default"]:not(:checked) ~ .occ-wrap[data-color="default"] {{ display: none !important; }}
+    </style>
+    <script>
+        function toggleContent(id) {{
+            console.log('toggleContent called with id:', id);
+            var content = document.getElementById(id);
+            if (!content) {{
+                console.error('Element not found:', id);
+                alert('Error: Could not find element with ID: ' + id);
+                return;
+            }}
+            var current = window.getComputedStyle(content).display;
+            console.log('Current display:', current);
+            if (current === "none") {{
+                content.style.display = "block";
+                console.log('Set to block');
+            }} else {{
+                content.style.display = "none";
+                console.log('Set to none');
+            }}
+        }}
+
+        function escapeHtml(text) {{
+            if (!text) return '';
+            return text
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;');
+        }}
+
+        // Open a log in a new tab and highlight the match region
+        function openLogTab(tabId, title, contentId, startPos, endPos) {{
+            var buttons = document.getElementById('tabButtons');
+            var panels = document.getElementById('tabPanels');
+            if (!buttons || !panels) return;
+
+            var panel = document.getElementById(tabId);
+            if (!panel) {{
+                var btn = document.createElement('button');
+                btn.className = 'tab-button';
+                btn.id = 'btn_' + tabId;
+                btn.innerHTML = escapeHtml(title) + ' <span class="tab-close" onclick="closeTab(\'' + tabId + '\')">✕</span>';
+                btn.onclick = function() {{ selectTab(tabId); }};
+                buttons.appendChild(btn);
+
+                panel = document.createElement('div');
+                panel.className = 'tab-panel';
+                panel.id = tabId;
+                panels.appendChild(panel);
+            }}
+
+            var rawContentElement = document.getElementById(contentId);
+            var raw = rawContentElement ? (rawContentElement.textContent || rawContentElement.innerText || '') : '';
+
+            if (startPos < 0 || endPos > raw.length || startPos >= endPos) {{
+                panel.innerHTML = escapeHtml(raw);
+            }} else {{
+                var before = raw.slice(0, startPos);
+                var match = raw.slice(startPos, endPos);
+                var after = raw.slice(endPos);
+                var html = escapeHtml(before) + '<span class="highlight">' + escapeHtml(match) + '</span>' + escapeHtml(after);
+                panel.innerHTML = html;
+            }}
+
+            selectTab(tabId);
+
+            setTimeout(function() {{
+                var rect = panel.querySelector('.highlight');
+                if (rect) {{
+                    var top = rect.offsetTop - 16;
+                    panel.scrollTo({{ top: top, behavior: 'smooth' }});
+                }}
+            }}, 50);
+        }}
+
+        function selectTab(tabId) {{
+            var buttons = document.querySelectorAll('.tab-button');
+            buttons.forEach(function(b) {{ b.classList.remove('active'); }});
+            var panels = document.querySelectorAll('.tab-panel');
+            panels.forEach(function(p) {{ p.classList.remove('active'); }});
+            var btn = document.getElementById('btn_' + tabId);
+            if (btn) btn.classList.add('active');
+            var panel = document.getElementById(tabId);
+            if (panel) panel.classList.add('active');
+        }}
+
+        function closeTab(tabId) {{
+            var btn = document.getElementById('btn_' + tabId);
+            var panel = document.getElementById(tabId);
+            if (btn) btn.remove();
+            if (panel) panel.remove();
+        }}
+
+        // (Color filtering is pure CSS — no JS needed)
+    </script>
+</head>
+<body>
+    <a id="top"></a>
+    <h1>FEV Block Run Report</h1>
+    <p class="timestamp">Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+    <div id="logTabs" class="tabs">
+        <div id="tabButtons" class="tab-buttons"></div>
+        <div id="tabPanels" class="tab-panels"></div>
+    </div>
+"""
+    
+    def _generate_summary_table(self, block_results):
+        """Generate summary table of all blocks."""
+        html = '<h2>Summary</h2>\n'
+        html += '<p style="font-size:0.85em;color:#666;margin-bottom:6px;">Counts shown as <strong>remaining / ignored / total</strong> &mdash; remaining are active issues, ignored were suppressed by ignore patterns, total = remaining + ignored.</p>\n'
+        html += '<table>\n'
+        html += '<tr><th>Block Name</th><th>Status</th><th>Errors<br><span style="font-weight:normal;font-size:0.8em;">remaining/ignored/total</span></th><th>Warnings<br><span style="font-weight:normal;font-size:0.8em;">remaining/ignored/total</span></th><th>Infos<br><span style="font-weight:normal;font-size:0.8em;">remaining/ignored/total</span></th><th>Block Directory</th></tr>\n'
+        
+        for result in block_results:
+            block_name = result['block_name']
+            status = result['overall_status']
+            block_dir = result['block_dir']
+            
+            # remaining = not ignored, ignored = suppressed by ignore patterns, total = remaining + ignored
+            rem_errors   = sum(len(r['errors'])           for r in result['log_results'].values())
+            ign_errors   = sum(len(r.get('ignored_errors',   [])) for r in result['log_results'].values())
+            tot_errors   = rem_errors + ign_errors
+            rem_warnings = sum(len(r['warnings'])         for r in result['log_results'].values())
+            ign_warnings = sum(len(r.get('ignored_warnings', [])) for r in result['log_results'].values())
+            tot_warnings = rem_warnings + ign_warnings
+            rem_infos    = sum(len(r['infos'])             for r in result['log_results'].values())
+            ign_infos    = sum(len(r.get('ignored_infos',    [])) for r in result['log_results'].values())
+            tot_infos    = rem_infos + ign_infos
+
+            def fmt(rem, ign, tot):
+                rem_style = 'color:#cc0000;font-weight:bold;' if rem > 0 else ''
+                ign_style = 'color:#888;'
+                tot_style = 'color:#333;'
+                return (f'<span style="{rem_style}" title="remaining (active)">{rem}</span>'
+                        f' / <span style="{ign_style}" title="ignored by pattern">{ign}</span>'
+                        f' / <span style="{tot_style}" title="total matched">{tot}</span>')
+
+            # ── Status color from the 'status' report_pattern ──────────────────
+            # Collect title_color values from every occurrence whose name == 'status'
+            _COLOR_RANK = {'red': 3, 'orange': 2, 'yellow': 1, 'green': 0}
+            _COLOR_BG   = {'red': '#cc2222', 'orange': '#ff9933', 'yellow': '#ccaa00', 'green': '#44aa44'}
+            _COLOR_LABEL = {'red': 'FAIL', 'orange': 'WARN', 'yellow': 'INFO', 'green': 'PASS'}
+
+            status_colors_found = []
+            for log_result in result['log_results'].values():
+                for sec in log_result.get('report_sections', []):
+                    if sec.get('name', '').lower() == 'status' and sec.get('title_color'):
+                        status_colors_found.append(sec['title_color'].lower())
+
+            if status_colors_found:
+                # Worst color wins (highest rank)
+                winning = max(status_colors_found, key=lambda c: _COLOR_RANK.get(c, -1))
+                color = _COLOR_BG.get(winning, winning)   # use hex bg if known, else raw CSS
+                label = _COLOR_LABEL.get(winning, winning.upper())
+            else:
+                # Fallback to overall_status when no 'status' pattern found
+                color = self.STATUS_COLORS[status]
+                label = self.STATUS_LABELS[status]
+            # ───────────────────────────────────────────────────────────────────
+
+            html += f'<tr id="summary_{block_name}">\n'
+            html += f'  <td><a href="#block_{block_name}">{block_name}</a></td>\n'
+            html += f'  <td class="status-cell" style="background-color: {color}; color: white;">{label}</td>\n'
+            html += f'  <td style="text-align: center;">{fmt(rem_errors, ign_errors, tot_errors)}</td>\n'
+            html += f'  <td style="text-align: center;">{fmt(rem_warnings, ign_warnings, tot_warnings)}</td>\n'
+            html += f'  <td style="text-align: center;">{fmt(rem_infos, ign_infos, tot_infos)}</td>\n'
+            html += f'  <td><code>{block_dir}</code></td>\n'
+            html += f'</tr>\n'
+        
+        html += '</table>\n'
+        return html
+    
+    def _generate_detailed_sections(self, block_results):
+        """Generate detailed sections for each block."""
+        html = '<h2>Detailed Results</h2>\n'
+        
+        for result in block_results:
+            html += self._generate_block_section(result)
+        
+        return html
+    
+    def _generate_block_section(self, result):
+        """Generate detailed section for a single block."""
+        block_name = result['block_name']
+        status = result['overall_status']
+        color = self.STATUS_COLORS[status]
+        label = self.STATUS_LABELS[status]
+        
+        html = f'<div class="block-section" id="block_{block_name}">\n'
+        html += f'  <h3>{block_name} <span class="status-cell" style="background-color: {color}; color: white; padding: 5px 10px; font-size: 0.8em;">{label}</span></h3>\n'
+        
+        # Iterate through each log file
+        for log_type, log_result in result['log_results'].items():
+            html += self._generate_log_section(log_type, log_result, block_name)
+        
+        html += f'  <p style="text-align: right; margin-top: 15px;"><a href="#summary_{block_name}" style="color: #007acc; text-decoration: none; font-weight: bold;">↑ Back to Summary</a></p>\n'
+        html += '</div>\n'
+        return html
+    
+    def _generate_log_section(self, log_type, log_result, block_name):
+        """Generate section for a single log file."""
+        html = f'<h4>{log_type}</h4>\n'
+        
+        if not log_result['exists']:
+            html += '<p style="color: #999;">Log file not found</p>\n'
+            return html
+        
+        html += f'<p><strong>File:</strong> <code>{log_result["path"]}</code></p>\n'
+        
+        var_base = f"{block_name}_{log_type}".replace(' ', '_')
+        log_viewer_filename = f"block_html/{var_base}_log_viewer.html"
+        
+        # Link to open full log viewer in a named tab (so line number clicks reuse the same tab)
+        html += f'<a href="{log_viewer_filename}" target="log_viewer_{var_base}" style="display: inline-block; padding: 10px 15px; background-color: #007acc; color: white; text-decoration: none; border-radius: 4px; margin: 8px 0; font-weight: bold;">📖 Open Full Log Viewer in New Tab</a>\n'
+        html += f'<a href="file://{log_result["path"]}" target="_blank" style="display: inline-block; margin-left: 10px; padding: 10px 15px; background-color: #666; color: white; text-decoration: none; border-radius: 4px; margin: 8px 0; font-weight: bold;">📄 Open Raw File</a>\n'
+        
+        # Report sections - Group by pattern type with hierarchical structure
+        # Only include sections that have a title_format (csv-only patterns are excluded)
+        html_report_sections = [r for r in log_result.get('report_sections', []) if r.get('has_title_format')]
+        if html_report_sections:
+            # Group report sections by base pattern name
+            grouped_reports = {}
+            for report in html_report_sections:
+                # Extract base name (remove occurrence suffix)
+                base_name = report['name'].split(' (Occurrence')[0]
+                if base_name not in grouped_reports:
+                    grouped_reports[base_name] = []
+                grouped_reports[base_name].append(report)
+            
+            # Count reports by color
+            color_counts = {}
+            for report in html_report_sections:
+                color = report.get('title_color')
+                if not color:
+                    color = 'default'
+                color_counts[color] = color_counts.get(color, 0) + 1
+            
+            # Define section ID before building badges (badges reference it in onclick)
+            reports_section_id = f"{block_name}_{log_type}_reports"
+
+            # Build color count display (display only)
+            color_badges = []
+            for color, count in sorted(color_counts.items()):
+                if color and color != 'default':
+                    color_badges.append(f'<span style="color: {color}; font-weight: bold; margin-left: 8px;">&#9679;{count}</span>')
+                elif color == 'default':
+                    color_badges.append(f'<span style="color: #666; font-weight: bold; margin-left: 8px;">&#9679;{count}</span>')
+            color_display = ''.join(color_badges)
+
+            # Create top-level Reports dropdown
+            total_reports = len(html_report_sections)
+            html += f'<details style="margin-top: 10px; border: 1px solid #ccc; border-radius: 3px; padding: 0;"><summary style="cursor: pointer; padding: 10px; background-color: #f0f0f0; font-weight: bold; user-select: none; display: flex; justify-content: space-between; align-items: center;"><span>Reports ({total_reports})</span><span>{color_display}</span></summary>\n'
+            html += f'<div id="{reports_section_id}" style="padding: 10px; background-color: #fafafa; border-top: 1px solid #ddd;">\n'
+            
+            # For each pattern type, create a sub-dropdown
+            for base_name, reports in grouped_reports.items():
+                pattern_section_id = f"{block_name}_{log_type}_pattern_{base_name.replace(' ', '_').replace(':', '')}"
+
+                # Build per-pattern color count badges (same style as the top-level Reports header)
+                pat_color_counts = {}
+                for r in reports:
+                    c = r.get('title_color') or 'default'
+                    pat_color_counts[c] = pat_color_counts.get(c, 0) + 1
+                pat_badges = []
+                for c, cnt in sorted(pat_color_counts.items()):
+                    if c and c != 'default':
+                        pat_badges.append(f'<span style="color: {c}; font-weight: bold; margin-left: 8px;">&#9679;{cnt}</span>')
+                    else:
+                        pat_badges.append(f'<span style="color: #666; font-weight: bold; margin-left: 8px;">&#9679;{cnt}</span>')
+                pat_color_display = ''.join(pat_badges)
+
+                html += f'  <details style="margin-left: 10px; margin-top: 8px; border: 1px solid #ddd; border-radius: 3px; padding: 0;"><summary style="cursor: pointer; padding: 10px; background-color: #f5f5f5; user-select: none; display: flex; justify-content: space-between; align-items: center;"><span>{base_name} ({len(reports)})</span><span>{pat_color_display}</span></summary>\n'
+                html += f'  <div id="{pattern_section_id}" style="padding: 10px; background-color: white; border-top: 1px solid #ddd;">\n'
+
+                # Pure CSS filter: checkbox + label siblings BEFORE the occ-wrap divs
+                # "All" button uses tiny JS to check/uncheck all .cf inputs in the same container
+                html += f'    <span style="display:inline-flex;align-items:center;gap:4px;margin-bottom:8px;"><strong style="font-size:0.85em;">Filter:</strong> <button class="cf-label" style="border:2px solid #007acc;background:#e3f2fd;cursor:pointer;padding:4px 10px;border-radius:4px;font-size:0.9em;font-weight:bold;" onclick="var c=this.parentElement.parentElement;var cbs=c.querySelectorAll(\'input.cf\');var allChecked=true;cbs.forEach(function(x){{if(!x.checked)allChecked=false;}});cbs.forEach(function(x){{x.checked=!allChecked;}});">All</button></span>\n'
+                for c_color, c_cnt in sorted(pat_color_counts.items()):
+                    dot_c = c_color if c_color and c_color != 'default' else '#aaa'
+                    c_label = c_color if c_color and c_color != 'default' else 'default'
+                    cb_id = f"{pattern_section_id}_cf_{c_color}"
+                    html += f'    <input type="checkbox" class="cf" id="{cb_id}" data-color="{c_color}" checked>\n'
+                    html += f'    <label class="cf-label" for="{cb_id}"><span style="color:{dot_c};font-size:1.2em;">&#9679;</span> {c_label} ({c_cnt})</label>\n'
+                
+                # For each occurrence
+                for idx, report in enumerate(reports, 1):
+                    occurrence_id = f"{pattern_section_id}_occ{idx}"
+                    # Use custom_title from pattern groups if available, else default
+                    if report.get('custom_title'):
+                        occurrence_label = report['custom_title']
+                    else:
+                        occurrence_label = f"Occurrence {idx}" if len(reports) > 1 else "Data"
+                    title_color = report.get('title_color')
+                    start_pos = report.get('start_pos', 0)
+                    end_pos = report.get('end_pos', 0)
+                    line_num = report.get('line_number', 0)
+                    
+                    # Build title style with optional color
+                    title_style = 'font-weight: bold;'
+                    if title_color:
+                        title_style += f' color: {title_color};'
+                    
+                    # Convert escape sequences and optional \| column separators to HTML.
+                    # See _title_to_html() for the full set of supported sequences.
+                    occurrence_label_html = _title_to_html(occurrence_label)
+                    
+                    # Create link to the log viewer HTML file with anchor to the specific line
+                    log_viewer_filename = f"block_html/{var_base}_log_viewer.html"
+                    line_anchor = f"log_{var_base}_line_{line_num}"
+                    log_viewer_link = f"{log_viewer_filename}#{line_anchor}"
+                    occ_color_attr = title_color if title_color else 'default'
+                    html += f'    <div class="occ-wrap" data-color="{occ_color_attr}" style="margin-left: 10px; margin-top: 6px;">\n'
+                    html += f'    <details style="border: 1px solid #eee; border-radius: 3px; padding: 0;"><summary style="cursor: pointer; padding: 8px; background-color: #f9f9f9; user-select: none; display: flex; justify-content: space-between; align-items: center;">\n'
+                    html += f'      <span style="{title_style}">{occurrence_label_html}</span>\n'
+                    html += f'      <a href="{log_viewer_link}" target="log_viewer_{var_base}" style="font-size: 0.85em; color: #007acc; text-decoration: none; font-weight: bold;">📄 Line {line_num}</a>\n'
+                    html += f'    </summary>\n'
+                    html += f'    <div id="{occurrence_id}" style="padding: 10px; background-color: white; border-top: 1px solid #eee;">\n'
+                    html += '      <div style="font-family: monospace; white-space: pre-wrap; word-wrap: break-word; background-color: #f5f5f5; padding: 10px; border: 1px solid #ddd; border-radius: 4px; font-size: 0.9em;">\n'
+                    html += '        ' + self._escape_html(report['content']).replace('\n', '\n        ')
+                    html += '\n      </div>\n'
+                    html += '    </div>\n'
+                    html += '    </details>\n'
+                    html += '    </div>\n'
+                
+                html += '  </div>\n'
+                html += '  </details>\n'
+            
+            html += '</div>\n'
+            html += '</details>\n'
+        
+        # Prepare log viewer link info (used for Errors/Warnings/Infos)
+        log_viewer_filename = f"block_html/{var_base}_log_viewer.html"
+        
+        # Errors
+        if log_result['errors']:
+            section_id = f"{block_name}_{log_type}_errors"
+            error_count = len(log_result['errors'])
+            html += f'<details style="margin-top: 10px; border: 1px solid #ccc; border-radius: 3px; padding: 0;"><summary style="cursor: pointer; padding: 10px; background-color: #f0f0f0; font-weight: bold; user-select: none; display: flex; justify-content: space-between; align-items: center;"><span>Errors ({error_count})</span><span style="color: #ff4444; font-weight: bold;">●{error_count}</span></summary>\n'
+            html += f'<div id="{section_id}" style="padding: 10px; background-color: #fafafa; border-top: 1px solid #ddd;">\n'
+            for line_num, line in log_result['errors']:
+                line_anchor = f"log_{var_base}_line_{line_num}"
+                log_viewer_link = f"{log_viewer_filename}#{line_anchor}"
+                html += f'<div class="log-entry error"><a href="{log_viewer_link}" target="log_viewer_{var_base}" style="color: #007acc; text-decoration: none; font-weight: bold;">Line {line_num}:</a> {self._escape_html(line)}</div>\n'
+            html += '</div></details>\n'
+        
+        # Warnings
+        if log_result['warnings']:
+            section_id = f"{block_name}_{log_type}_warnings"
+            warning_count = len(log_result['warnings'])
+            html += f'<details style="margin-top: 10px; border: 1px solid #ccc; border-radius: 3px; padding: 0;"><summary style="cursor: pointer; padding: 10px; background-color: #f0f0f0; font-weight: bold; user-select: none; display: flex; justify-content: space-between; align-items: center;"><span>Warnings ({warning_count})</span><span style="color: #ff9933; font-weight: bold;">●{warning_count}</span></summary>\n'
+            html += f'<div id="{section_id}" style="padding: 10px; background-color: #fafafa; border-top: 1px solid #ddd;">\n'
+            for line_num, line in log_result['warnings']:
+                line_anchor = f"log_{var_base}_line_{line_num}"
+                log_viewer_link = f"{log_viewer_filename}#{line_anchor}"
+                html += f'<div class="log-entry warning"><a href="{log_viewer_link}" target="log_viewer_{var_base}" style="color: #007acc; text-decoration: none; font-weight: bold;">Line {line_num}:</a> {self._escape_html(line)}</div>\n'
+            html += '</div></details>\n'
+        
+        # Infos
+        if log_result['infos']:
+            section_id = f"{block_name}_{log_type}_infos"
+            info_count = len(log_result['infos'])
+            html += f'<details style="margin-top: 10px; border: 1px solid #ccc; border-radius: 3px; padding: 0;"><summary style="cursor: pointer; padding: 10px; background-color: #f0f0f0; font-weight: bold; user-select: none; display: flex; justify-content: space-between; align-items: center;"><span>Info ({info_count})</span><span style="color: #ffdd44; font-weight: bold;">●{info_count}</span></summary>\n'
+            html += f'<div id="{section_id}" style="padding: 10px; background-color: #fafafa; border-top: 1px solid #ddd;">\n'
+            for line_num, line in log_result['infos']:
+                line_anchor = f"log_{var_base}_line_{line_num}"
+                log_viewer_link = f"{log_viewer_filename}#{line_anchor}"
+                html += f'<div class="log-entry info"><a href="{log_viewer_link}" target="log_viewer_{var_base}" style="color: #007acc; text-decoration: none; font-weight: bold;">Line {line_num}:</a> {self._escape_html(line)}</div>\n'
+            html += '</div></details>\n'
+        
+        
+        if not log_result['errors'] and not log_result['warnings'] and not log_result['infos'] and not html_report_sections:
+            html += '<p style="color: #44cc44;">✓ No issues found</p>\n'
+        
+        return html
+    
+    def _escape_html(self, text):
+        """Escape HTML special characters."""
+        return text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+
+    # ------------------------------------------------------------------
+    # Chip-hierarchy rendering helpers
+    # ------------------------------------------------------------------
+
+    def _aggregate_counts(self, node_name, node_children, results_by_name):
+        """Return ``(rem_e, ign_e, rem_w, ign_w)`` summed across *node_name* and
+        all its descendants (recursive).  Nodes without data contribute zeros."""
+        rem_e = ign_e = rem_w = ign_w = 0
+        if node_name in results_by_name:
+            result = results_by_name[node_name]
+            for r in result['log_results'].values():
+                rem_e += len(r.get('errors', []))
+                ign_e += len(r.get('ignored_errors', []))
+                rem_w += len(r.get('warnings', []))
+                ign_w += len(r.get('ignored_warnings', []))
+        for child_name, child_children in node_children.items():
+            ce, ci, cw, cwi = self._aggregate_counts(child_name, child_children, results_by_name)
+            rem_e += ce; ign_e += ci; rem_w += cw; ign_w += cwi
+        return rem_e, ign_e, rem_w, ign_w
+
+    @staticmethod
+    def _fmt_counts(rem, ign, tot, rem_css='color:#cc0000', zero_css='color:#888'):
+        """Return a compact HTML badge: ``rem / ign / tot``.
+
+        All three numbers are always shown so the format is consistent:
+        * *rem* (remaining) is highlighted when > 0.
+        * *ign* (waived/ignored) is shown in muted style.
+        * *tot* (total = rem+ign) closes the triple.
+        A ``title`` tooltip spells out the meaning.
+        """
+        rem_style = rem_css if rem > 0 else zero_css
+        return (
+            f'<span title="remaining / waived / total" style="font-size:0.82em;font-weight:bold;">'
+            f'<span style="{rem_style}">{rem}</span>'
+            f'<span style="color:#aaa;font-weight:normal;">/</span>'
+            f'<span style="color:#888;">{ign}</span>'
+            f'<span style="color:#aaa;font-weight:normal;">/</span>'
+            f'<span style="color:#555;">{tot}</span>'
+            f'</span>'
+        )
+
+    def _compute_aggregate_status(self, node_name, node_children, results_by_name):
+        """Return the worst-case aggregate status for *node_name* and all descendants.
+
+        If the node itself has run results those take precedence over
+        any child aggregation.  Nodes with no data anywhere return 'nodata'.
+        """
+        if node_name in results_by_name:
+            return results_by_name[node_name]['overall_status']
+        if not node_children:
+            return 'nodata'
+        child_statuses = [
+            self._compute_aggregate_status(c, cc, results_by_name)
+            for c, cc in node_children.items()
+        ]
+        real = [s for s in child_statuses if s != 'nodata']
+        if not real:
+            return 'nodata'
+        return max(real, key=lambda s: self._STATUS_RANK.get(s, -1))
+
+    def _render_hierarchy_node(self, node_name, node_children, results_by_name, depth=0):
+        """Recursively render one chip-hierarchy node as a collapsible <details>.
+
+        *depth* 0 = CF cluster, 1 = block instance, 2+ = sub-instance.
+        CF nodes default to expanded; deeper levels are collapsed.
+        """
+        status = self._compute_aggregate_status(node_name, node_children, results_by_name)
+        color  = self.STATUS_COLORS.get(status, '#aaaaaa')
+        label  = self.STATUS_LABELS.get(status, status.upper())
+        has_data = node_name in results_by_name
+        result   = results_by_name.get(node_name)
+
+        open_attr = ' open' if depth == 0 else ''
+
+        # Summary bar style – progressively lighter with depth
+        if depth == 0:
+            sum_bg  = '#e8f0fe'
+            sum_bdr = '2px solid #3f51b5'
+            sum_fnt = 'font-weight:bold; font-size:1.0em;'
+        elif depth == 1:
+            sum_bg  = '#f5f5f5'
+            sum_bdr = '1px solid #bdbdbd'
+            sum_fnt = 'font-weight:600;'
+        else:
+            sum_bg  = '#ffffff'
+            sum_bdr = '1px solid #e0e0e0'
+            sum_fnt = ''
+
+        html  = f'<details class="hier-node"{open_attr} style="margin:4px 0;">\n'
+        html += (f'  <summary style="display:flex;align-items:center;gap:10px;cursor:pointer;'
+                 f'padding:8px 12px;border-radius:4px;user-select:none;'
+                 f'background:{sum_bg};border:{sum_bdr};{sum_fnt}">\n')
+        html += f'    <span style="font-family:\'Courier New\',monospace;">{node_name}</span>\n'
+
+        # Inline error / warning counts: remaining / waived / total
+        rem_e, ign_e, rem_w, ign_w = self._aggregate_counts(node_name, node_children, results_by_name)
+        tot_e = rem_e + ign_e
+        tot_w = rem_w + ign_w
+        if tot_e > 0:
+            html += (f'    <span style="font-size:0.82em;">'
+                     f'<span style="color:#cc0000;font-weight:bold;">E:</span>&nbsp;'
+                     f'{self._fmt_counts(rem_e, ign_e, tot_e)}'
+                     f'</span>\n')
+        if tot_w > 0:
+            html += (f'    <span style="font-size:0.82em;">'
+                     f'<span style="color:#cc7a00;font-weight:bold;">W:</span>&nbsp;'
+                     f'{self._fmt_counts(rem_w, ign_w, tot_w, rem_css="color:#cc7a00")}'
+                     f'</span>\n')
+
+        html += (f'    <span style="margin-left:auto;background:{color};color:white;'
+                 f'padding:3px 10px;border-radius:12px;font-size:0.82em;font-weight:bold;">'
+                 f'{label}</span>\n')
+        html += '  </summary>\n'
+
+        html += '  <div style="padding-left:20px;border-left:2px solid #e0e4f0;margin-left:8px;margin-top:4px;">\n'
+
+        # Recurse into children first, then emit this node's data section
+        for child_name, child_children in node_children.items():
+            html += self._render_hierarchy_node(child_name, child_children, results_by_name, depth + 1)
+
+        if has_data and result:
+            html += self._generate_block_section(result)
+        elif not node_children:
+            html += '    <div style="padding:8px 12px;color:#999;font-style:italic;font-size:0.9em;">No data available</div>\n'
+
+        html += '  </div>\n'
+        html += '</details>\n'
+        return html
+
+    def _generate_hierarchical_view(self, block_results, chip_name, hierarchy):
+        """Render the full chip hierarchy as nested collapsible sections.
+
+        All blocks from the schema are shown.  Blocks with run results display
+        their actual status and detail; blocks without data show 'No Data'.
+        """
+        results_by_name = {r['block_name']: r for r in block_results}
+
+        # Aggregate chip-level status from all CF children
+        child_statuses = [
+            self._compute_aggregate_status(cf, cf_ch, results_by_name)
+            for cf, cf_ch in hierarchy.items()
+        ]
+        real = [s for s in child_statuses if s != 'nodata']
+        chip_status = max(real, key=lambda s: self._STATUS_RANK.get(s, -1)) if real else 'nodata'
+        chip_color  = self.STATUS_COLORS.get(chip_status, '#aaaaaa')
+        chip_label  = self.STATUS_LABELS.get(chip_status, chip_status.upper())
+
+        html  = '<h2>Chip Hierarchy</h2>\n'
+        html += '<div style="margin:10px 0;">\n'
+
+        # ── Chip-level (skylp) collapsible ──────────────────────────────────
+        html += '<details open>\n'
+        html += (f'  <summary style="display:flex;align-items:center;gap:12px;cursor:pointer;'
+                 f'padding:10px 18px;border-radius:6px;background:#1a237e;color:white;'
+                 f'user-select:none;font-size:1.15em;font-weight:bold;">\n')
+        html += (f'    <span style="font-family:\'Courier New\',monospace;letter-spacing:1px;">'
+                 f'{chip_name.upper()}</span>\n')
+
+        # Chip-level aggregate counts
+        chip_rem_e = chip_ign_e = chip_rem_w = chip_ign_w = 0
+        for cf, cf_ch in hierarchy.items():
+            ce, ci, cw, cwi = self._aggregate_counts(cf, cf_ch, results_by_name)
+            chip_rem_e += ce; chip_ign_e += ci; chip_rem_w += cw; chip_ign_w += cwi
+        chip_tot_e = chip_rem_e + chip_ign_e
+        chip_tot_w = chip_rem_w + chip_ign_w
+        if chip_tot_e > 0:
+            html += (f'    <span style="font-size:0.9em;">'
+                     f'<span style="color:#ffaaaa;font-weight:bold;">E:</span>&thinsp;'
+                     f'<span title="remaining / waived / total" style="font-weight:bold;">'
+                     f'<span style="color:#ff8888;">{chip_rem_e}</span>'
+                     f'<span style="color:#ccc;font-weight:normal;">/</span>'
+                     f'<span style="color:#bbb;">{chip_ign_e}</span>'
+                     f'<span style="color:#ccc;font-weight:normal;">/</span>'
+                     f'<span style="color:#eee;">{chip_tot_e}</span>'
+                     f'</span></span>\n')
+        if chip_tot_w > 0:
+            html += (f'    <span style="font-size:0.9em;">'
+                     f'<span style="color:#ffcc88;font-weight:bold;">W:</span>&thinsp;'
+                     f'<span title="remaining / waived / total" style="font-weight:bold;">'
+                     f'<span style="color:#ffa040;">{chip_rem_w}</span>'
+                     f'<span style="color:#ccc;font-weight:normal;">/</span>'
+                     f'<span style="color:#bbb;">{chip_ign_w}</span>'
+                     f'<span style="color:#ccc;font-weight:normal;">/</span>'
+                     f'<span style="color:#eee;">{chip_tot_w}</span>'
+                     f'</span></span>\n')
+
+        html += (f'    <span style="margin-left:auto;background:{chip_color};'
+                 f'padding:4px 14px;border-radius:14px;font-size:0.85em;">{chip_label}</span>\n')
+        html += '  </summary>\n'
+        html += '  <div style="padding-left:20px;border-left:3px solid #1a237e;margin-left:10px;margin-top:6px;">\n'
+
+        for cf_name, cf_children in hierarchy.items():
+            html += self._render_hierarchy_node(cf_name, cf_children, results_by_name, depth=0)
+
+        html += '  </div>\n'
+        html += '</details>\n'
+        html += '</div>\n'
+        return html
+
+    def _generate_footer(self):
+        """Generate HTML footer."""
+        return """
+</body>
+</html>
+"""
+    
+    def _generate_log_viewer_html(self, log_result, block_name, log_type, output_dir):
+        """Generate a standalone HTML file for log viewing with line numbers."""
+        var_base = f"{block_name}_{log_type}".replace(' ', '_')
+        viewer_filename = os.path.join(output_dir, f"{var_base}_log_viewer.html")
+        
+        html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Log Viewer: {block_name}/{log_type}</title>
+    <style>
+        body {{
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }}
+        h1 {{
+            color: #333;
+            border-bottom: 3px solid #007acc;
+            padding-bottom: 10px;
+        }}
+        .controls {{
+            background-color: white;
+            padding: 10px;
+            margin-bottom: 15px;
+            border-radius: 4px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }}
+        .search-box {{
+            padding: 8px;
+            width: 300px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            font-family: 'Courier New', monospace;
+        }}
+        .log-viewer {{
+            background-color: white;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            padding: 0;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            font-family: 'Courier New', monospace;
+            font-size: 13px;
+            line-height: 1.6;
+            overflow-x: auto;
+        }}
+        .log-line {{
+            padding: 2px 8px;
+            display: flex;
+            border-bottom: 1px solid #f0f0f0;
+        }}
+        .log-line:hover {{
+            background-color: #f9f9f9;
+        }}
+        .log-line-number {{
+            color: #888;
+            margin-right: 15px;
+            user-select: none;
+            display: inline-block;
+            min-width: 50px;
+            text-align: right;
+            flex-shrink: 0;
+        }}
+        .log-line-content {{
+            flex-grow: 1;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            color: #333;
+        }}
+        .log-line.error {{
+            background-color: #ffeeee;
+            border-left: 3px solid #ff4444;
+        }}
+        .log-line.warning {{
+            background-color: #fff8ee;
+            border-left: 3px solid #ff9933;
+        }}
+        .log-line.info {{
+            background-color: #fffcee;
+            border-left: 3px solid #ffdd44;
+        }}
+        .log-line.report {{
+            background-color: #f0f8ff;
+            border-left: 3px solid #007acc;
+            font-weight: bold;
+        }}
+        .log-line:target {{
+            background-color: #ffff99 !important;
+            border-left: 4px solid #ffdd44;
+        }}
+    </style>
+</head>
+<body>
+    <h1>📖 Log Viewer: {block_name}/{log_type}</h1>
+    <p><strong>File:</strong> <code>{log_result.get("path", "Unknown")}</code></p>
+    
+    <div class="controls">
+        <input type="text" class="search-box" id="searchBox" placeholder="Use Ctrl+F to search lines...">
+    </div>
+    
+    <div class="log-viewer" id="logViewer">
+"""
+        
+        # Read and process log lines
+        try:
+            with open(log_result["path"], 'r', encoding='utf-8', errors='ignore') as lf:
+                log_lines = lf.readlines()
+        except:
+            log_lines = []
+        
+        # Build a set of special lines for quick lookup
+        error_lines = {line_num for line_num, _ in log_result.get('errors', [])}
+        warning_lines = {line_num for line_num, _ in log_result.get('warnings', [])}
+        info_lines = {line_num for line_num, _ in log_result.get('infos', [])}
+        report_start_lines = {report.get('line_number') for report in log_result.get('report_sections', [])}
+        
+        # Generate line HTML
+        for line_idx, log_line in enumerate(log_lines, 1):
+            line_anchor = f"log_{var_base}_line_{line_idx}"
+            
+            # Determine line class
+            line_class = ""
+            if line_idx in error_lines:
+                line_class = "error"
+            elif line_idx in warning_lines:
+                line_class = "warning"
+            elif line_idx in info_lines:
+                line_class = "info"
+            elif line_idx in report_start_lines:
+                line_class = "report"
+            
+            class_attr = f' class="log-line {line_class}"' if line_class else ' class="log-line"'
+            
+            # Escape HTML
+            line_content = log_line.rstrip()
+            line_content = line_content.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+            
+            html += f'<div id="{line_anchor}"{class_attr}><span class="log-line-number">{line_idx}</span><span class="log-line-content">{line_content}</span></div>\n'
+        
+        html += """    </div>
+</body>
+</html>
+"""
+        
+        # Write the standalone HTML file
+        try:
+            with open(viewer_filename, 'w', encoding='utf-8') as f:
+                f.write(html)
+            return viewer_filename
+        except Exception as e:
+            print(f"Warning: Failed to write log viewer file {viewer_filename}: {e}")
+            return None
+
+
+class CSVReportGenerator:
+    """Generates CSV report from analysis results."""
+
+    def __init__(self, output_dir):
+        self.output_dir = output_dir
+
+    def generate_custom_csvs(self, block_results, csv_directives, chip_name, hierarchy,
+                             ordered_pattern_names):
+        """Generate custom CSV files declared by ``csv`` directives in pattern.yaml.
+
+        Each directive looks like::
+
+            - csv: 'status.csv'
+              cols: block_name, hier_name, status
+              data: block_name, hier_name, pattern1.group1
+
+        ``cols`` defines the header row.  ``data`` maps column expressions
+        (comma-separated) to the header.  Supported expressions:
+
+        * ``block_name``          – the block being analysed
+        * ``hier_name``           – dot-path(s) from the chip hierarchy
+        * ``patternN.groupM``     – Nth report_pattern, group M (worst-ranked occ)
+        * ``patternN.patternM.groupK`` – via sub_patterns
+
+        One row is emitted per (block, hier_path) pair.  A block absent from
+        the hierarchy still gets one row with an empty ``hier_name``.
+        """
+        if not csv_directives:
+            return
+
+        for directive in csv_directives:
+            csv_filename = directive.get('csv', 'custom_report.csv')
+            cols_raw = directive.get('cols', '')
+            data_raw = directive.get('data', '')
+
+            headers = [c.strip() for c in cols_raw.split(',') if c.strip()]
+            exprs   = [c.strip() for c in data_raw.split(',') if c.strip()]
+
+            # Pad / truncate to same length
+            while len(exprs) < len(headers):
+                exprs.append('')
+            exprs = exprs[:len(headers)]
+
+            out_path = os.path.join(self.output_dir, csv_filename)
+            try:
+                with open(out_path, 'w', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(headers)
+
+                    for result in block_results:
+                        block_name = result['block_name']
+
+                        # Collect ALL report_sections across every log file for this block
+                        all_sections = []
+                        for lr in result['log_results'].values():
+                            all_sections.extend(lr.get('report_sections', []))
+
+                        # Determine hier_paths for this block
+                        if chip_name and hierarchy:
+                            hier_paths = _find_block_paths(block_name, chip_name, hierarchy)
+                        else:
+                            hier_paths = []
+                        if not hier_paths:
+                            hier_paths = ['']  # still emit one row
+
+                        for hier_path in hier_paths:
+                            row = [
+                                _resolve_csv_expr(expr, block_name, hier_path,
+                                                  all_sections, ordered_pattern_names,
+                                                  block_dir=result['block_dir'])
+                                for expr in exprs
+                            ]
+                            writer.writerow(row)
+
+                print(f"Custom CSV generated: {out_path}")
+            except Exception as e:
+                print(f"Error generating custom CSV '{csv_filename}': {e}")
+
+    def generate(self, block_results):
+        """Generate CSV reports for each block."""
+        csv_dir = os.path.join(self.output_dir, 'block_csv')
+        os.makedirs(csv_dir, exist_ok=True)
+        # Generate summary CSV
+        summary_file = os.path.join(csv_dir, 'fev_report_summary.csv')
+        self._generate_summary_csv(block_results, summary_file)
+        
+        # Generate detailed CSV for each block
+        for result in block_results:
+            block_name = result['block_name']
+            csv_file = os.path.join(csv_dir, f'{block_name}_detailed_report.csv')
+            self._generate_detailed_csv(result, csv_file)
+    
+    def _generate_summary_csv(self, block_results, csv_file):
+        """Generate summary CSV with one row per block."""
+        try:
+            with open(csv_file, 'w', newline='') as f:
+                writer = csv.writer(f)
+                
+                # Write header
+                writer.writerow(['Block Name', 'Status', 'Total Errors', 'Total Warnings', 'Total Infos', 'Block Directory'])
+                
+                # Write data for each block
+                for result in block_results:
+                    block_name = result['block_name']
+                    status = result['overall_status']
+                    block_dir = result['block_dir']
+                    
+                    # Count totals
+                    total_errors = sum(len(r['errors']) for r in result['log_results'].values())
+                    total_warnings = sum(len(r['warnings']) for r in result['log_results'].values())
+                    total_infos = sum(len(r['infos']) for r in result['log_results'].values())
+                    
+                    writer.writerow([block_name, status, total_errors, total_warnings, total_infos, block_dir])
+            
+            print(f"Summary CSV generated: {csv_file}")
+        except Exception as e:
+            print(f"Error generating summary CSV: {e}")
+    
+    # Regex to extract warning class code, e.g:
+    #   "Warning: (RTL9.21)"     -> class='RTL9.21',    major='RTL'
+    #   "Warning: (LIB_LINT_121)" -> class='LIB_LINT_121', major='LIB'
+    _WARN_CLASS_RE = re.compile(r'Warning:\s*\(([A-Za-z][A-Za-z0-9_.]*)')
+    _MAJOR_PREFIX_RE = re.compile(r'^([A-Za-z]+)')
+
+    @classmethod
+    def _extract_warn_class(cls, line):
+        """Return (major_class, class_code) from a warning line, or ('', '') if not found."""
+        m = cls._WARN_CLASS_RE.search(line)
+        if m:
+            code  = m.group(1)                        # e.g. 'RTL9.21' or 'LIB_LINT_121'
+            pm = cls._MAJOR_PREFIX_RE.match(code)
+            major = pm.group(1) if pm else code       # e.g. 'RTL' or 'LIB'
+            return major, code
+        return '', ''
+
+    def _generate_detailed_csv(self, result, csv_file):
+        """Generate detailed CSV for a single block with all log entries."""
+        try:
+            with open(csv_file, 'w', newline='') as f:
+                writer = csv.writer(f)
+                
+                # Write header
+                writer.writerow(['Block Name', 'Log Type', 'Issue Type', 'Line Number', 'Message', 'Major Class', 'Class'])
+                
+                block_name = result['block_name']
+                
+                # Write data for each log file
+                for log_type, log_result in result['log_results'].items():
+                    if not log_result['exists']:
+                        writer.writerow([block_name, log_type, 'N/A', 'N/A', 'File not found', '', ''])
+                        continue
+                    
+                    # Write report sections
+                    for report in log_result.get('report_sections', []):
+                        content = report['content']
+                        writer.writerow([block_name, log_type, 'REPORT', report['name'],
+                                         content[:100] + '...' if len(content) > 100 else content,
+                                         '', ''])
+                    
+                    # Write errors
+                    for line_num, line in log_result['errors']:
+                        writer.writerow([block_name, log_type, 'ERROR', line_num, line, '', ''])
+                    
+                    # Write warnings — also extract class code
+                    for line_num, line in log_result['warnings']:
+                        major, code = self._extract_warn_class(line)
+                        writer.writerow([block_name, log_type, 'WARNING', line_num, line, major, code])
+                    
+                    # Write infos
+                    for line_num, line in log_result['infos']:
+                        writer.writerow([block_name, log_type, 'INFO', line_num, line, '', ''])
+            
+            print(f"Detailed CSV generated: {csv_file}")
+        except Exception as e:
+            print(f"Error generating detailed CSV for {result['block_name']}: {e}")
+
+
+def _parse_files_field(raw):
+    """Normalise the 'files' field: accept list or space-separated string."""
+    if not raw:
+        return []
+    if isinstance(raw, str):
+        return raw.split()
+    return list(raw)
+
+
+def _merge_pattern_config(base, override):
+    """Merge block-specific config into a copy of the global base.
+
+    All keys APPEND to global (never replace), except report_patterns where
+    an entry with the same 'name' replaces the global entry.
+    """
+    merged = copy.deepcopy(base)
+
+    # files — append block files to global files
+    if 'files' in override:
+        merged.setdefault('files', [])
+        merged['files'].extend(_parse_files_field(override['files']))
+
+    # ignore lists — append
+    for key in ('ignore_error', 'ignore_warning', 'ignore_info'):
+        if key in override:
+            merged.setdefault(key, [])
+            merged[key].extend(override[key])
+
+    # error/warning/info patterns — append
+    for key in ('error_patterns', 'warning_patterns', 'info_patterns'):
+        if key in override:
+            merged.setdefault(key, [])
+            merged[key].extend(override[key])
+
+    # report_patterns — append new names, replace existing by name
+    if 'report_patterns' in override:
+        # Separate real patterns from csv directives in the override as well
+        ovr_csv = [rp for rp in override['report_patterns'] if isinstance(rp, dict) and 'csv' in rp]
+        ovr_rp  = [rp for rp in override['report_patterns'] if not (isinstance(rp, dict) and 'csv' in rp)]
+        merged.setdefault('report_patterns', [])
+        base_index = {rp.get('name'): i for i, rp in enumerate(merged['report_patterns'])}
+        for rp in ovr_rp:
+            name = rp.get('name')
+            if name and name in base_index:
+                merged['report_patterns'][base_index[name]] = rp  # replace
+            else:
+                merged['report_patterns'].append(rp)              # append new
+        # Merge csv directives: append (keyed by 'csv' filename, replace if same name)
+        merged.setdefault('csv_directives', [])
+        existing_csv = {d.get('csv') for d in merged['csv_directives']}
+        for d in ovr_csv:
+            if d.get('csv') in existing_csv:
+                merged['csv_directives'] = [x for x in merged['csv_directives'] if x.get('csv') != d.get('csv')]
+            merged['csv_directives'].append(d)
+        # Rebuild ordered_pattern_names
+        merged['_ordered_pattern_names'] = [rp.get('name', f'pattern{i+1}')
+                                             for i, rp in enumerate(merged['report_patterns'])]
+
+    return merged
+
+
+def load_global_pattern_config(pattern_file):
+    """Load global pattern configuration from YAML file."""
+    if not pattern_file or not os.path.isfile(pattern_file):
+        return None
+    
+    try:
+        with open(pattern_file, 'r') as f:
+            config = yaml.safe_load(f) or {}
+
+        # Separate real report_patterns from csv directives
+        raw_rp = config.get('report_patterns', [])
+        real_rp = [rp for rp in raw_rp if not (isinstance(rp, dict) and 'csv' in rp)]
+        csv_dirs = [rp for rp in raw_rp if isinstance(rp, dict) and 'csv' in rp]
+
+        pattern_config = {
+            'error_patterns': config.get('error_patterns', []),
+            'warning_patterns': config.get('warning_patterns', []),
+            'info_patterns': config.get('info_patterns', []),
+            'ignore_error': config.get('ignore_error', []),
+            'ignore_warning': config.get('ignore_warning', []),
+            'ignore_info': config.get('ignore_info', []),
+            'report_patterns': real_rp,
+            'csv_directives': csv_dirs,
+            # ordered list of pattern names (1-indexed as pattern1, pattern2…)
+            '_ordered_pattern_names': [rp.get('name', f'pattern{i+1}')
+                                       for i, rp in enumerate(real_rp)],
+            'files': _parse_files_field(config.get('files', [])),
+            '_pattern_file_dir': os.path.dirname(os.path.abspath(pattern_file))
+        }
+
+        print(f"Loaded global pattern configuration from {pattern_file}")
+        print(f"  Error patterns: {len(pattern_config['error_patterns'])}")
+        print(f"  Warning patterns: {len(pattern_config['warning_patterns'])}")
+        print(f"  Info patterns: {len(pattern_config['info_patterns'])}")
+        print(f"  Report patterns: {len(pattern_config['report_patterns'])}")
+        print(f"  CSV directives: {len(pattern_config['csv_directives'])}")
+        print(f"  Ignore error patterns: {len(pattern_config['ignore_error'])}")
+        print(f"  Ignore warning patterns: {len(pattern_config['ignore_warning'])}")
+        print(f"  Ignore info patterns: {len(pattern_config['ignore_info'])}")
+        
+        return pattern_config
+    except Exception as e:
+        print(f"Warning: Failed to load global pattern file {pattern_file}: {e}")
+        return None
+
+
+def _find_block_paths(block_name, chip_name, hierarchy):
+    """Return a list of parent-path strings for every place *block_name* appears
+    in the chip hierarchy.
+
+    Example: 'upaw' lives directly under 'cf100' → ['skylp.cf100'].
+    'ldm' lives under 'cf700.lduw' → ['skylp.cf700.lduw'].
+    'llpw' appears under cf300/cf301/cf302/cf303 → four paths.
+    """
+    paths = []
+
+    def _search(node_children, prefix):
+        for name, children in (node_children or {}).items():
+            if name == block_name:
+                paths.append(prefix)
+            _search(children or {}, f"{prefix}.{name}")
+
+    for cf_name, cf_children in hierarchy.items():
+        if cf_name == block_name:
+            paths.append(chip_name)
+        _search(cf_children or {}, f"{chip_name}.{cf_name}")
+
+    return paths
+
+
+def _walk_section_path(section, rest_parts):
+    """Resolve *rest_parts* (a dot-split tail) against a report-section dict.
+
+    *rest_parts* examples:
+      ['group1']                          – main capture group
+      ['pattern1', 'group1']             – sub-pattern group
+      ['pattern3', 'pattern1', 'group1'] – nested sub-pattern group
+
+    Returns a string, empty string on any miss.
+    """
+    if not rest_parts:
+        return ''
+    first = rest_parts[0]
+    remaining = rest_parts[1:]
+
+    if first.startswith('group'):
+        val = section.get('groups', {}).get(first)
+        return str(val) if val is not None else ''
+
+    if first.startswith('pattern'):
+        node = section.get('sub_patterns', {}).get(first)
+        if node is None:
+            return ''
+        # Walk remaining parts via PatternNode attribute access.
+        # PatternNode.__getattr__ returns '' for missing groupN and an empty
+        # PatternNode for missing patternN, so traversal never raises.
+        for part in remaining:
+            node = getattr(node, part, None)
+            if node is None:
+                return ''
+        # At the end we expect a scalar (groupN value), not a PatternNode.
+        return '' if node is None else str(node)
+
+    return ''
+
+
+# Regex to parse   info.yaml(field_name)   expressions in CSV data directives.
+_INFO_YAML_RE = re.compile(r'^info\.yaml\(([^)]+)\)$')
+
+
+def _read_info_yaml_field(block_dir, field_name):
+    """Read *field_name* from ``info.yaml`` located in *block_dir*.
+
+    Returns
+    -------
+    str
+        The field value as a string, or one of the sentinel strings:
+        * ``'info.yaml not available'``   – file does not exist
+        * ``'info.yaml no data available'`` – file exists but key is absent / empty
+    """
+    if not block_dir:
+        return 'info.yaml not available'
+    info_path = os.path.join(block_dir, 'info.yaml')
+    if not os.path.isfile(info_path):
+        return 'info.yaml not available'
+    try:
+        with open(info_path, 'r') as fh:
+            data = yaml.safe_load(fh) or {}
+    except Exception:
+        return 'info.yaml not available'
+    val = data.get(field_name)
+    if val is None or val == '':
+        return 'info.yaml no data available'
+    return str(val)
+
+
+def _resolve_csv_expr(expr, block_name, hier_path, all_report_sections, ordered_names,
+                      block_dir=None):
+    """Resolve one data-column expression from a csv directive to a string.
+
+    Supported expression formats
+    ----------------------------
+    block_name
+        The block being analysed.
+    hier_name
+        Hierarchical dot-path from the chip schema (pre-computed per row).
+    info.yaml(field_name)
+        Read *field_name* from ``<block_dir>/info.yaml``.
+        Returns ``'info.yaml not available'`` when the file is missing and
+        ``'info.yaml no data available'`` when the key is absent or empty.
+    <pattern_name>.<dotpath>          ← preferred / name-based
+        Look up sections whose ``name`` field equals *pattern_name*, then
+        resolve *dotpath* against that section.  Examples::
+
+            status.group1
+            status.pattern1.group1
+            Overview.pattern3.pattern1.group1
+
+    patternN.<dotpath>                ← positional / legacy form
+        *N* is the 1-based index of the report_pattern in the ordered list.
+        Equivalent to using the name directly.  Kept for backward compat.
+    """
+    expr = expr.strip()
+    if expr == 'block_name':
+        return block_name
+    if expr == 'hier_name':
+        return hier_path
+
+    # info.yaml(field_name) — read from the block's info.yaml file
+    m_info = _INFO_YAML_RE.match(expr)
+    if m_info:
+        return _read_info_yaml_field(block_dir, m_info.group(1).strip())
+
+    parts = expr.split('.')
+    if not parts:
+        return ''
+
+    head = parts[0]
+    rest_parts = parts[1:]
+
+    # ── Resolve target pattern name ──────────────────────────────────────────
+    # Name-based: head is a known report_pattern name (e.g. 'status', 'Overview')
+    if head in ordered_names:
+        target_name = head
+    # Positional: head is 'patternN'
+    elif head.startswith('pattern'):
+        try:
+            pidx = int(head[len('pattern'):]) - 1   # 0-based
+        except ValueError:
+            return ''
+        if pidx < 0 or pidx >= len(ordered_names):
+            return ''
+        target_name = ordered_names[pidx]
+    else:
+        return ''
+
+    if not rest_parts:
+        return ''
+
+    # ── Find the worst-ranked occurrence of the target pattern ───────────────
+    _CRANK = {'red': 4, 'orange': 3, 'yellow': 2, 'green': 1}
+    best_rank = -1
+    best_value = ''
+
+    for section in all_report_sections:
+        # Strip the " (Occurrence N)" suffix when comparing names
+        sname = section.get('name', '').split(' (Occurrence')[0]
+        if sname != target_name:
+            continue
+        rank = _CRANK.get(str(section.get('title_color', '')).lower(), 0)
+        if rank < best_rank:
+            continue
+
+        val = _walk_section_path(section, rest_parts)
+        best_rank = rank
+        best_value = val
+
+    return best_value
+
+
+def load_chip_hierarchy(schema_file):
+    """Load the chip schema YAML and return ``(chip_name, hierarchy_dict)``.
+
+    *hierarchy_dict* maps each CF cluster name to a nested dict of its
+    instances::
+
+        {
+          'cf000': {'scpw': {'cmrt': {}}},
+          'cf001': {'appw': {'cmu': {}, 'cmv': {}, ...}},
+          ...
+        }
+
+    Returns ``(None, None)`` when the file cannot be read or the expected
+    chip structure is not found.
+    """
+    if not schema_file or not os.path.isfile(schema_file):
+        print(f"Note: chip schema not found at {schema_file!r} – hierarchy view disabled.")
+        return None, None
+
+    try:
+        with open(schema_file, 'r') as f:
+            raw = yaml.safe_load(f) or {}
+    except Exception as exc:
+        print(f"Warning: cannot load chip schema {schema_file!r}: {exc}")
+        return None, None
+
+    # The chip-level key is the first dict key whose value contains cf* sub-entries.
+    chip_name = None
+    chip_data = {}
+    for key, val in raw.items():
+        if isinstance(val, dict) and any(k.startswith('cf') for k in (val or {})):
+            chip_name = key
+            chip_data = val or {}
+            break
+
+    if chip_name is None:
+        print(f"Warning: no chip-level entry (with cf* children) found in {schema_file!r}")
+        return None, None
+
+    def _extract(node):
+        """Recursively extract named children from a YAML node's 'instances' map."""
+        if not isinstance(node, dict):
+            return {}
+        instances = node.get('instances') or {}
+        if not isinstance(instances, dict):
+            return {}
+        return {name: _extract(child or {}) for name, child in instances.items()}
+
+    hierarchy = {
+        cf_name: _extract(cf_data or {})
+        for cf_name, cf_data in chip_data.items()
+    }
+
+    print(f"Loaded chip hierarchy from {schema_file!r}: "
+          f"{len(hierarchy)} CF clusters under '{chip_name}'")
+    return chip_name, hierarchy
+
+
+def find_all_blocks(run_location):
+    """Find all block directories in the run location."""
+    blocks = []
+    
+    # Look for directories that contain a block run
+    # Pattern: directories that have fv/ subdirectory or *_lec_*.log files
+    for item in os.listdir(run_location):
+        item_path = os.path.join(run_location, item)
+        if os.path.isdir(item_path):
+            # Check if it looks like a block run directory
+            has_fv = os.path.isdir(os.path.join(item_path, 'fv'))
+            has_lec_log = bool(glob.glob(os.path.join(item_path, '*_lec_*.log')))
+            
+            if has_fv or has_lec_log:
+                blocks.append((item, item_path))
+    
+    return blocks
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Generate HTML report from FEV block run logs")
+    parser.add_argument('--run_location', help='Base directory containing block runs (default: current directory)')
+    parser.add_argument('--output', default='fev_report.html', help='Output HTML file name')
+    parser.add_argument('--block_name', help='Analyze only a specific block (optional)')
+    parser.add_argument('--pattern_file', help='Path to global pattern.yaml file')
+    args = parser.parse_args()
+    
+    # Use current directory if run_location not specified
+    run_location = args.run_location if args.run_location else os.getcwd()
+    
+    if not os.path.isdir(run_location):
+        print(f"ERROR: Run location does not exist: {run_location}")
+        sys.exit(1)
+    
+    # Load global pattern configuration
+    global_pattern_config = None
+    if args.pattern_file:
+        global_pattern_config = load_global_pattern_config(args.pattern_file)
+    else:
+        # Look for pattern.yaml in the script directory
+        script_dir = Path(__file__).parent
+        default_pattern_file = os.path.join(script_dir, 'pattern.yaml')
+        if os.path.isfile(default_pattern_file):
+            print(f"Using default pattern file: {default_pattern_file}")
+            global_pattern_config = load_global_pattern_config(default_pattern_file)
+    
+    # Find all blocks
+    if args.block_name:
+        block_dir = os.path.join(run_location, args.block_name)
+        if not os.path.isdir(block_dir):
+            print(f"ERROR: Block directory not found: {block_dir}")
+            sys.exit(1)
+        blocks = [(args.block_name, block_dir)]
+    else:
+        blocks = find_all_blocks(run_location)
+    
+    if not blocks:
+        print(f"No block runs found in {run_location}")
+        sys.exit(1)
+    
+    print(f"Found {len(blocks)} block(s) to analyze")
+    
+    # Analyze each block
+    results = []
+    pattern_file_dir = run_location  # look for ${block}.pattern.yaml in run_location (cwd)
+    for block_name, block_dir in blocks:
+        print(f"Analyzing {block_name}...")
+        # Merge block-specific pattern file if it exists
+        block_config = global_pattern_config
+        if pattern_file_dir:
+            block_yaml = os.path.join(pattern_file_dir, f"{block_name}.pattern.yaml")
+            if os.path.isfile(block_yaml):
+                print(f"  Merging block-specific patterns from {block_yaml}")
+                try:
+                    with open(block_yaml, 'r') as bf:
+                        block_override = yaml.safe_load(bf) or {}
+                    block_config = _merge_pattern_config(global_pattern_config, block_override)
+                    print(f"    files: {len(block_config.get('files',[]))} total, "
+                          f"ignore_error: {len(block_config.get('ignore_error',[]))}, "
+                          f"ignore_warning: {len(block_config.get('ignore_warning',[]))}, "
+                          f"report_patterns: {len(block_config.get('report_patterns',[]))}")
+                except Exception as e:
+                    print(f"  Warning: failed to load {block_yaml}: {e}")
+            else:
+                print(f"  No block-specific pattern file at {block_yaml}")
+        analyzer = BlockRunAnalyzer(block_dir, block_name, block_config)
+        result = analyzer.analyze()
+        results.append(result)
+    
+    # Generate HTML report
+    output_path = os.path.join(run_location, args.output)
+    # If output_path is a directory, append default filename
+    if os.path.isdir(output_path):
+        output_path = os.path.join(output_path, 'fev_report.html')
+
+    # Load chip hierarchy from the hardcoded schema path
+    chip_hierarchy = load_chip_hierarchy(CHIP_SCHEMA)
+
+    generator = HTMLReportGenerator(output_path)
+    generator.generate(results, chip_hierarchy=chip_hierarchy)
+    
+    # Generate CSV reports
+    csv_generator = CSVReportGenerator(run_location)
+    csv_generator.generate(results)
+
+    # Generate custom CSVs declared via 'csv:' directives in pattern.yaml
+    csv_directives      = (global_pattern_config or {}).get('csv_directives', [])
+    ordered_pat_names   = (global_pattern_config or {}).get('_ordered_pattern_names', [])
+    _chip_name = chip_hierarchy[0] if chip_hierarchy and chip_hierarchy[0] else None
+    _hierarchy = chip_hierarchy[1] if chip_hierarchy and len(chip_hierarchy) > 1 else None
+    csv_generator.generate_custom_csvs(
+        results, csv_directives, _chip_name, _hierarchy, ordered_pat_names
+    )
+    
+    print(f"\nReport generation complete!")
+    print(f"Summary:")
+    for result in results:
+        status_label = HTMLReportGenerator.STATUS_LABELS[result['overall_status']]
+        print(f"  {result['block_name']}: {status_label}")
+
+
+if __name__ == '__main__':
+    main()
