@@ -5,6 +5,10 @@
 # Default run type
 type: "rtl_syn"
 
+block_subblock_config:
+  scpw: scu
+  upaw: ucb
+
 # Run type specific configurations
 rtl_syn:
   location: "/proj/pd/rel/skylp/syn/logical"

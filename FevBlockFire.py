@@ -66,7 +66,8 @@ def load_config(config_path):
         'type': default_type,
         'rtl_syn': cfg.get('rtl_syn', {}),
         'rtl_rtl': cfg.get('rtl_rtl', {}),
-        'syn_pnr': cfg.get('syn_pnr', {})
+        'syn_pnr': cfg.get('syn_pnr', {}),
+        'block_subblock_config': cfg.get('block_subblock_config', {})
     }
     print(f"Config loaded with default type: {default_type}")
     return config
@@ -690,7 +691,12 @@ def main():
         config_path = os.path.join(script_dir, 'fevConfig.yaml')
 
     config = load_config(config_path)
-    
+
+    _subblock_map = config.get('block_subblock_config', {})
+    flist_block_name = _subblock_map.get(args.block_name, args.block_name)
+    if flist_block_name != args.block_name:
+        print(f"Note: block_subblock_config maps '{args.block_name}' -> '{flist_block_name}' for flist generation")
+
     # Determine the run type
     run_type = args.type if args.type else config.get('type')
     
@@ -758,8 +764,8 @@ def main():
         
         # Resolve flist files - check if they're files or tags
         # Pass block_dir so generate_flist directory is created inside it
-        resolved_golden = resolve_flist_file(golden_flist, args.block_name, config.get('rtl_rtl', {}), block_dir)
-        resolved_revised = resolve_flist_file(revised_flist, args.block_name, config.get('rtl_rtl', {}), block_dir)
+        resolved_golden = resolve_flist_file(golden_flist, flist_block_name, config.get('rtl_rtl', {}), block_dir)
+        resolved_revised = resolve_flist_file(revised_flist, flist_block_name, config.get('rtl_rtl', {}), block_dir)
         
         if not resolved_golden:
             logging.error(f"Golden flist could not be resolved: {golden_flist}")
@@ -798,7 +804,7 @@ def main():
             _write_refire(run_dir_base)
             
             # Resolve golden flist from tag or file
-            resolved_golden = resolve_flist_file(golden_tag, args.block_name, type_config, flist_gen_dir)
+            resolved_golden = resolve_flist_file(golden_tag, flist_block_name, type_config, flist_gen_dir)
             if not resolved_golden:
                 logging.error(f"Golden flist could not be resolved: {golden_tag}")
                 sys.exit(1)
