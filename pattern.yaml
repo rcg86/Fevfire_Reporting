@@ -116,7 +116,7 @@ report_patterns:
     color_rules:
       - condition: 'group1 == "Equivalent"'
         color: 'green'
-      - condition: 'group1 != "Equivalent"'
+      - condition: 'True'
         color: 'red'
   
   - name: 'Overview'

@@ -902,6 +902,13 @@ class HTMLReportGenerator:
         .collapsible:active {{
             background-color: #d0d0d0;
         }}
+        /* Remove default marker from block-level summary bars */
+        details > summary {{
+            list-style: none;
+        }}
+        details > summary::-webkit-details-marker {{
+            display: none;
+        }}
         .content {{
             display: none;
             padding: 10px;
@@ -1189,21 +1196,54 @@ class HTMLReportGenerator:
         return html
     
     def _generate_block_section(self, result):
-        """Generate detailed section for a single block."""
+        """Generate a collapsible section for a single block.
+
+        The <summary> bar is always visible and shows:
+          block name | status badge | E/W/I counts | ↑ Summary link
+        Clicking expands the full log detail (log file sections, errors, etc.).
+        """
         block_name = result['block_name']
         status = result['overall_status']
         color = self.STATUS_COLORS[status]
         label = self.STATUS_LABELS[status]
-        
-        html = f'<div class="block-section" id="block_{block_name}">\n'
-        html += f'  <h3>{block_name} <span class="status-cell" style="background-color: {color}; color: white; padding: 5px 10px; font-size: 0.8em;">{label}</span></h3>\n'
-        
-        # Iterate through each log file
+
+        # Counts for the summary bar (remaining / active issues only)
+        rem_errors   = sum(len(r['errors'])   for r in result['log_results'].values())
+        rem_warnings = sum(len(r['warnings']) for r in result['log_results'].values())
+        rem_infos    = sum(len(r['infos'])    for r in result['log_results'].values())
+
+        count_parts = []
+        if rem_errors:
+            count_parts.append(
+                f'<span style="background:#ffcdd2;color:#b71c1c;border-radius:10px;'
+                f'padding:1px 8px;font-size:0.8em;font-weight:bold;">E:{rem_errors}</span>')
+        if rem_warnings:
+            count_parts.append(
+                f'<span style="background:#ffe0b2;color:#e65100;border-radius:10px;'
+                f'padding:1px 8px;font-size:0.8em;font-weight:bold;">W:{rem_warnings}</span>')
+        if rem_infos:
+            count_parts.append(
+                f'<span style="background:#fff9c4;color:#f57f17;border-radius:10px;'
+                f'padding:1px 8px;font-size:0.8em;font-weight:bold;">I:{rem_infos}</span>')
+        counts_html = ' '.join(count_parts)
+
+        # Collapsed by default — user clicks to see log details
+        html  = f'<details id="block_{block_name}" style="margin-bottom:6px;border:1px solid #ddd;border-radius:5px;background:white;box-shadow:0 1px 3px rgba(0,0,0,0.07);">\n'
+        html += f'  <summary style="cursor:pointer;padding:10px 16px;display:flex;align-items:center;gap:10px;user-select:none;background:#f8f9fa;border-radius:5px;list-style:none;">\n'
+        html += f'    <span style="font-family:\'Courier New\',monospace;font-weight:bold;min-width:160px;">{block_name}</span>\n'
+        html += f'    <span style="background:{color};color:white;padding:2px 10px;border-radius:10px;font-size:0.8em;font-weight:bold;">{label}</span>\n'
+        if counts_html:
+            html += f'    {counts_html}\n'
+        html += f'    <a href="#summary_{block_name}" onclick="event.stopPropagation();" style="margin-left:auto;color:#007acc;text-decoration:none;font-size:0.82em;font-weight:bold;white-space:nowrap;">↑ Summary</a>\n'
+        html += f'  </summary>\n'
+        html += f'  <div style="padding:16px 20px;">\n'
+
         for log_type, log_result in result['log_results'].items():
             html += self._generate_log_section(log_type, log_result, block_name)
-        
-        html += f'  <p style="text-align: right; margin-top: 15px;"><a href="#summary_{block_name}" style="color: #007acc; text-decoration: none; font-weight: bold;">↑ Back to Summary</a></p>\n'
-        html += '</div>\n'
+
+        html += f'    <p style="text-align:right;margin-top:15px;"><a href="#summary_{block_name}" style="color:#007acc;text-decoration:none;font-weight:bold;">↑ Back to Summary</a></p>\n'
+        html += f'  </div>\n'
+        html += '</details>\n'
         return html
     
     def _generate_log_section(self, log_type, log_result, block_name):
@@ -1449,8 +1489,8 @@ class HTMLReportGenerator:
     def _render_hierarchy_node(self, node_name, node_children, results_by_name, depth=0):
         """Recursively render one chip-hierarchy node as a collapsible <details>.
 
-        *depth* 0 = CF cluster, 1 = block instance, 2+ = sub-instance.
-        CF nodes default to expanded; deeper levels are collapsed.
+        All levels are open by default so the full tree is visible on load.
+        Only the inner detail sections (Reports/Errors/Warnings/Info) are collapsed.
         """
         status = self._compute_aggregate_status(node_name, node_children, results_by_name)
         color  = self.STATUS_COLORS.get(status, '#aaaaaa')
@@ -1458,7 +1498,7 @@ class HTMLReportGenerator:
         has_data = node_name in results_by_name
         result   = results_by_name.get(node_name)
 
-        open_attr = ' open' if depth == 0 else ''
+        open_attr = ' open'  # all hierarchy levels expanded on load
 
         # Summary bar style – progressively lighter with depth
         if depth == 0:
@@ -1924,6 +1964,297 @@ class CSVReportGenerator:
         except Exception as e:
             print(f"Error generating detailed CSV for {result['block_name']}: {e}")
 
+    # ------------------------------------------------------------------
+    # HTML status-page generation (mirrors generate_custom_csvs)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _html_escape(text):
+        """Escape HTML special characters."""
+        return (str(text)
+                .replace('&', '&amp;')
+                .replace('<', '&lt;')
+                .replace('>', '&gt;')
+                .replace('"', '&quot;'))
+
+    def generate_custom_htmls(self, block_results, csv_directives, chip_name, hierarchy,
+                               ordered_pattern_names):
+        """Generate an HTML status page for every ``csv:`` directive in pattern.yaml.
+
+        For each ``csv: 'xxx.csv'`` directive a parallel ``xxx.html`` is written
+        to the same output directory.  The table mirrors the CSV columns with
+        colour-coding and sort / filter controls.
+        """
+        if not csv_directives:
+            return
+
+        for directive in csv_directives:
+            csv_filename = directive.get('csv', 'custom_report.csv')
+            html_filename = re.sub(r'\.csv$', '.html', csv_filename, flags=re.IGNORECASE)
+            if html_filename == csv_filename:
+                html_filename = csv_filename + '.html'
+
+            cols_raw = directive.get('cols', '')
+            data_raw = directive.get('data', '')
+
+            headers = [c.strip() for c in cols_raw.split(',') if c.strip()]
+            exprs   = [c.strip() for c in data_raw.split(',') if c.strip()]
+            while len(exprs) < len(headers):
+                exprs.append('')
+            exprs = exprs[:len(headers)]
+
+            # Index of the 'status' column so we can apply the fallback below
+            hdr_lower = [h.lower().strip() for h in headers]
+            status_col_idx = next((i for i, h in enumerate(hdr_lower) if h == 'status'), None)
+
+            # Collect rows — identical logic to generate_custom_csvs
+            rows = []
+            for result in block_results:
+                block_name = result['block_name']
+                all_sections = []
+                for lr in result['log_results'].values():
+                    all_sections.extend(lr.get('report_sections', []))
+
+                if chip_name and hierarchy:
+                    hier_paths = _find_block_paths(block_name, chip_name, hierarchy)
+                else:
+                    hier_paths = []
+                if not hier_paths:
+                    hier_paths = ['']
+
+                for hier_path in hier_paths:
+                    row = [
+                        _resolve_csv_expr(expr, block_name, hier_path,
+                                          all_sections, ordered_pattern_names,
+                                          block_dir=result['block_dir'])
+                        for expr in exprs
+                    ]
+                    # If the status cell is blank (LEC status pattern not found in the log),
+                    # derive a fallback.  A clean log (no errors/warnings) most likely means
+                    # the run is still in progress, so show RUNNING.  Any log-level issues
+                    # surface as ERROR / WARNING so the user knows something went wrong.
+                    if status_col_idx is not None and not (row[status_col_idx] or '').strip():
+                        overall = result.get('overall_status', 'nodata')
+                        if overall == 'success':
+                            # No LEC result yet and no log issues — job is likely still running.
+                            row[status_col_idx] = 'data: RUNNING'
+                        else:
+                            label = HTMLReportGenerator.STATUS_LABELS.get(overall, overall.upper())
+                            row[status_col_idx] = f'data: {label}'
+                    rows.append(row)
+
+            out_path = os.path.join(self.output_dir, html_filename)
+            try:
+                self._write_status_html(out_path, html_filename, headers, rows)
+                print(f"Status HTML generated: {out_path}")
+            except Exception as e:
+                print(f"Error generating status HTML '{html_filename}': {e}")
+
+    def _write_status_html(self, out_path, title, headers, rows):
+        """Render *rows* as a styled, sortable, filterable single-page HTML table."""
+        header_lower = [h.lower().strip() for h in headers]
+
+        # Identify special columns by name for automatic colour-coding
+        status_col = next((i for i, h in enumerate(header_lower) if h == 'status'), None)
+        noneq_col  = next((i for i, h in enumerate(header_lower) if 'noneq' in h), None)
+        abort_col  = next((i for i, h in enumerate(header_lower) if 'abort' in h), None)
+        pass_col   = next((i for i, h in enumerate(header_lower)
+                           if h in ('modules pass', 'pass', 'module pass')), None)
+
+        status_col_js = status_col if status_col is not None else -1
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        # Colour map for "data: <STATUS>" fallback values
+        _DATA_STATUS_STYLE = {
+            'pass':    'background:#dcedc8;color:#33691e;font-weight:bold;font-style:italic;',
+            'running': 'background:#e3f2fd;color:#0d47a1;font-weight:bold;font-style:italic;',
+            'error':   'background:#ffcdd2;color:#b71c1c;font-weight:bold;font-style:italic;',
+            'warning': 'background:#ffe0b2;color:#e65100;font-weight:bold;font-style:italic;',
+            'info':    'background:#fff9c4;color:#f57f17;font-weight:bold;font-style:italic;',
+            'missing': 'background:#eeeeee;color:#757575;font-weight:bold;font-style:italic;',
+            'no data': 'background:#eeeeee;color:#9e9e9e;font-style:italic;',
+        }
+
+        def _cell_style(col_idx, value):
+            base = 'padding:8px 12px;border-bottom:1px solid #e0e0e0;'
+            if col_idx == status_col:
+                v = (value or '').strip().lower()
+                if v == 'equivalent':
+                    return base + 'background:#c8e6c9;color:#1b5e20;font-weight:bold;'
+                elif v.startswith('data: '):
+                    # Fallback value — colour by the embedded status keyword
+                    keyword = v[len('data: '):].strip()
+                    extra = _DATA_STATUS_STYLE.get(keyword, 'font-style:italic;')
+                    return base + extra
+                elif v:
+                    return base + 'background:#ffcdd2;color:#b71c1c;font-weight:bold;'
+            elif col_idx in (noneq_col, abort_col):
+                try:
+                    if int(value or 0) > 0:
+                        return base + 'background:#ffcdd2;color:#b71c1c;font-weight:bold;'
+                except (ValueError, TypeError):
+                    pass
+            elif col_idx == pass_col:
+                try:
+                    if int(value or 0) > 0:
+                        return base + 'color:#1b5e20;font-weight:bold;'
+                except (ValueError, TypeError):
+                    pass
+            return base
+
+        # ── Header ────────────────────────────────────────────────────────────
+        lines = []
+        lines.append('<!DOCTYPE html>')
+        lines.append('<html lang="en">')
+        lines.append('<head>')
+        lines.append('  <meta charset="UTF-8">')
+        lines.append('  <meta name="viewport" content="width=device-width, initial-scale=1.0">')
+        lines.append(f'  <title>FEV Block Status \u2014 {self._html_escape(title)}</title>')
+        lines.append('  <style>')
+        lines.append('    body{font-family:"Segoe UI",Tahoma,Geneva,Verdana,sans-serif;margin:20px;background:#f5f5f5;}')
+        lines.append('    h1{color:#333;border-bottom:3px solid #007acc;padding-bottom:10px;}')
+        lines.append('    .timestamp{color:#888;font-size:.9em;}')
+        lines.append('    .controls{display:flex;flex-wrap:wrap;gap:10px;align-items:center;background:white;')
+        lines.append('              padding:12px 16px;border-radius:6px;box-shadow:0 2px 4px rgba(0,0,0,.08);margin-bottom:16px;}')
+        lines.append('    .controls label{font-size:.9em;color:#555;}')
+        lines.append('    #filterInput{padding:6px 10px;border:1px solid #ccc;border-radius:4px;font-size:.9em;width:260px;}')
+        lines.append('    #statusFilter{padding:6px 10px;border:1px solid #ccc;border-radius:4px;font-size:.9em;}')
+        lines.append('    .stats{display:flex;gap:12px;flex-wrap:wrap;font-size:.88em;}')
+        lines.append('    .stat-badge{padding:4px 12px;border-radius:12px;font-weight:bold;}')
+        lines.append('    .stat-pass{background:#c8e6c9;color:#1b5e20;}')
+        lines.append('    .stat-fail{background:#ffcdd2;color:#b71c1c;}')
+        lines.append('    .stat-total{background:#e3f2fd;color:#0d47a1;}')
+        lines.append('    table{border-collapse:collapse;width:100%;background:white;')
+        lines.append('          box-shadow:0 2px 6px rgba(0,0,0,.1);font-size:.88em;}')
+        lines.append('    thead tr{background:#007acc;color:white;}')
+        lines.append('    th{padding:10px 14px;text-align:left;cursor:pointer;user-select:none;white-space:nowrap;}')
+        lines.append('    th:hover{background:#005fa3;}')
+        lines.append('    .sort-arrow{margin-left:4px;font-size:.8em;color:#cce4ff;}')
+        lines.append('    tbody tr{transition:background .12s;}')
+        lines.append('    tbody tr:hover{background:#f0f7ff;}')
+        lines.append('    tbody tr:nth-child(even){background:#fafafa;}')
+        lines.append('    tbody tr:nth-child(even):hover{background:#f0f7ff;}')
+        lines.append('    td{padding:8px 12px;border-bottom:1px solid #e0e0e0;white-space:nowrap;}')
+        lines.append('    td.wrap{white-space:normal;max-width:420px;word-break:break-all;}')
+        lines.append('    .hidden{display:none!important;}')
+        lines.append('    #rowCount{font-size:.85em;color:#666;}')
+        lines.append('  </style>')
+        lines.append('</head>')
+        lines.append('<body>')
+        lines.append('  <h1>FEV Block Status Report</h1>')
+        lines.append(f'  <p class="timestamp">Generated: {now} &nbsp;|&nbsp; Source: {self._html_escape(title)}</p>')
+        lines.append('  <div class="controls">')
+        lines.append('    <label>Search: <input type="text" id="filterInput" placeholder="Filter any column\u2026" oninput="applyFilters()"></label>')
+        lines.append('    <label>Status:')
+        lines.append('      <select id="statusFilter" onchange="applyFilters()">')
+        lines.append('        <option value="">All</option>')
+        lines.append('        <option value="equivalent">Equivalent (PASS)</option>')
+        lines.append('        <option value="non">Non-Equivalent / Abort (FAIL)</option>')
+        lines.append('      </select>')
+        lines.append('    </label>')
+        lines.append('    <div class="stats" id="statsBar"></div>')
+        lines.append('    <span id="rowCount"></span>')
+        lines.append('  </div>')
+
+        # ── Table ─────────────────────────────────────────────────────────────
+        lines.append('  <table id="statusTable">')
+        lines.append('    <thead><tr>')
+        for i, h in enumerate(headers):
+            lines.append(f'      <th onclick="sortTable({i})" data-col="{i}">'
+                         f'{self._html_escape(h)} <span class="sort-arrow" id="arrow_{i}">\u21c5</span></th>')
+        lines.append('    </tr></thead>')
+        lines.append('    <tbody id="tableBody">')
+
+        long_col_start = max(0, len(headers) - 4)   # last few columns wrap (paths)
+        for row_data in rows:
+            lines.append('      <tr>')
+            for ci, val in enumerate(row_data):
+                style = _cell_style(ci, val)
+                wrap = ' class="wrap"' if ci >= long_col_start else ''
+                # "data: RUNNING" / "data: ERROR" etc. → human-friendly label
+                display = val if val is not None else ''
+                if isinstance(display, str) and display.startswith('data: '):
+                    keyword = display[6:].strip().title()
+                    display = f'Not Completed \u2014 {keyword}'
+                lines.append(f'        <td style="{style}"{wrap}>{self._html_escape(display)}</td>')
+            lines.append('      </tr>')
+
+        lines.append('    </tbody>')
+        lines.append('  </table>')
+
+        # ── JavaScript ────────────────────────────────────────────────────────
+        lines.append('  <script>')
+        lines.append('    var _sortState = {col: -1, asc: true};')
+        lines.append(f'   var STATUS_COL = {status_col_js};')
+        lines.append('')
+        lines.append('    function applyFilters() {')
+        lines.append('      var text   = document.getElementById("filterInput").value.toLowerCase();')
+        lines.append('      var status = document.getElementById("statusFilter").value.toLowerCase();')
+        lines.append('      var rows   = document.getElementById("tableBody").querySelectorAll("tr");')
+        lines.append('      var visible = 0;')
+        lines.append('      rows.forEach(function(row) {')
+        lines.append('        var cells   = row.querySelectorAll("td");')
+        lines.append('        var rowText = Array.from(cells).map(function(c){return c.textContent;}).join(" ").toLowerCase();')
+        lines.append('        var textOk  = !text || rowText.indexOf(text) !== -1;')
+        lines.append('        var stOk    = true;')
+        lines.append('        if (status && STATUS_COL >= 0) {')
+        lines.append('          var sv = (cells[STATUS_COL] ? cells[STATUS_COL].textContent : "").toLowerCase().trim();')
+        lines.append('          if (status === "equivalent")  stOk = sv === "equivalent";')
+        lines.append('          else if (status === "non")    stOk = sv !== "equivalent" && sv !== "";')
+        lines.append('        }')
+        lines.append('        if (textOk && stOk) { row.classList.remove("hidden"); visible++; }')
+        lines.append('        else                { row.classList.add("hidden"); }')
+        lines.append('      });')
+        lines.append('      document.getElementById("rowCount").textContent =')
+        lines.append('        "Showing " + visible + " of " + rows.length + " block(s)";')
+        lines.append('      updateStats();')
+        lines.append('    }')
+        lines.append('')
+        lines.append('    function sortTable(col) {')
+        lines.append('      var tbody = document.getElementById("tableBody");')
+        lines.append('      var rows  = Array.from(tbody.querySelectorAll("tr"));')
+        lines.append('      var asc   = (_sortState.col === col) ? !_sortState.asc : true;')
+        lines.append('      _sortState = {col: col, asc: asc};')
+        lines.append('      rows.sort(function(a, b) {')
+        lines.append('        var av = a.querySelectorAll("td")[col];')
+        lines.append('        var bv = b.querySelectorAll("td")[col];')
+        lines.append('        av = av ? av.textContent.trim() : "";')
+        lines.append('        bv = bv ? bv.textContent.trim() : "";')
+        lines.append('        var an = parseFloat(av), bn = parseFloat(bv);')
+        lines.append('        if (!isNaN(an) && !isNaN(bn)) return asc ? an - bn : bn - an;')
+        lines.append('        return asc ? av.localeCompare(bv) : bv.localeCompare(av);')
+        lines.append('      });')
+        lines.append('      rows.forEach(function(r){ tbody.appendChild(r); });')
+        lines.append('      document.querySelectorAll(".sort-arrow").forEach(function(el){ el.textContent = "\u21c5"; });')
+        lines.append('      var arrow = document.getElementById("arrow_" + col);')
+        lines.append('      if (arrow) arrow.textContent = asc ? "\u2191" : "\u2193";')
+        lines.append('    }')
+        lines.append('')
+        lines.append('    function updateStats() {')
+        lines.append('      if (STATUS_COL < 0) return;')
+        lines.append('      var rows = document.getElementById("tableBody").querySelectorAll("tr:not(.hidden)");')
+        lines.append('      var pass = 0, fail = 0;')
+        lines.append('      rows.forEach(function(row) {')
+        lines.append('        var cells = row.querySelectorAll("td");')
+        lines.append('        if (!cells[STATUS_COL]) return;')
+        lines.append('        var sv = cells[STATUS_COL].textContent.trim().toLowerCase();')
+        lines.append('        if (sv === "equivalent") pass++;')
+        lines.append('        else if (sv) fail++;')
+        lines.append('      });')
+        lines.append('      document.getElementById("statsBar").innerHTML =')
+        lines.append('        \'<span class="stat-badge stat-pass">PASS: \' + pass + \'</span>\' +')
+        lines.append('        \'<span class="stat-badge stat-fail">FAIL: \' + fail + \'</span>\' +')
+        lines.append('        \'<span class="stat-badge stat-total">Total: \' + (pass+fail) + \'</span>\';')
+        lines.append('    }')
+        lines.append('')
+        lines.append('    window.onload = function(){ applyFilters(); };')
+        lines.append('  </script>')
+        lines.append('</body>')
+        lines.append('</html>')
+
+        with open(out_path, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(lines) + '\n')
+
 
 def _parse_files_field(raw):
     """Normalise the 'files' field: accept list or space-separated string."""
@@ -2289,11 +2620,22 @@ def main():
     parser.add_argument('--output', default='fev_report.html', help='Output HTML file name')
     parser.add_argument('--block_name', help='Analyze only a specific block (optional)')
     parser.add_argument('--pattern_file', help='Path to global pattern.yaml file')
+    parser.add_argument('--only_status', action='store_true',
+                        help='Only generate status.html (skips the main HTML report and CSV reports)')
     args = parser.parse_args()
-    
+
+    # Reject --output values that would collide with the auto-generated status.html
+    output_basename = os.path.basename(args.output).lower()
+    if output_basename == 'status.html':
+        print("ERROR: 'status.html' cannot be used as the --output filename because it "
+              "collides with the block-status page automatically generated from the "
+              "'status.csv' directive in pattern.yaml.\n"
+              "Please choose a different name (e.g. 'fev_report.html').")
+        sys.exit(1)
+
     # Use current directory if run_location not specified
     run_location = args.run_location if args.run_location else os.getcwd()
-    
+
     if not os.path.isdir(run_location):
         print(f"ERROR: Run location does not exist: {run_location}")
         sys.exit(1)
@@ -2353,31 +2695,46 @@ def main():
         result = analyzer.analyze()
         results.append(result)
     
-    # Generate HTML report
-    output_path = os.path.join(run_location, args.output)
-    # If output_path is a directory, append default filename
-    if os.path.isdir(output_path):
-        output_path = os.path.join(output_path, 'fev_report.html')
+    # Common setup needed by both full and status-only paths
+    csv_directives    = (global_pattern_config or {}).get('csv_directives', [])
+    ordered_pat_names = (global_pattern_config or {}).get('_ordered_pattern_names', [])
 
     # Load chip hierarchy from the hardcoded schema path
     chip_hierarchy = load_chip_hierarchy(CHIP_SCHEMA)
-
-    generator = HTMLReportGenerator(output_path)
-    generator.generate(results, chip_hierarchy=chip_hierarchy)
-    
-    # Generate CSV reports
-    csv_generator = CSVReportGenerator(run_location)
-    csv_generator.generate(results)
-
-    # Generate custom CSVs declared via 'csv:' directives in pattern.yaml
-    csv_directives      = (global_pattern_config or {}).get('csv_directives', [])
-    ordered_pat_names   = (global_pattern_config or {}).get('_ordered_pattern_names', [])
     _chip_name = chip_hierarchy[0] if chip_hierarchy and chip_hierarchy[0] else None
     _hierarchy = chip_hierarchy[1] if chip_hierarchy and len(chip_hierarchy) > 1 else None
-    csv_generator.generate_custom_csvs(
-        results, csv_directives, _chip_name, _hierarchy, ordered_pat_names
-    )
-    
+
+    csv_generator = CSVReportGenerator(run_location)
+
+    if args.only_status:
+        # Fast path: only generate status.html, skip everything else
+        print("\nRunning in --only_status mode: generating status.html only.")
+        csv_generator.generate_custom_htmls(
+            results, csv_directives, _chip_name, _hierarchy, ordered_pat_names
+        )
+    else:
+        # Generate HTML report
+        output_path = os.path.join(run_location, args.output)
+        # If output_path is a directory, append default filename
+        if os.path.isdir(output_path):
+            output_path = os.path.join(output_path, 'fev_report.html')
+
+        generator = HTMLReportGenerator(output_path)
+        generator.generate(results, chip_hierarchy=chip_hierarchy)
+
+        # Generate CSV reports
+        csv_generator.generate(results)
+
+        # Generate custom CSVs declared via 'csv:' directives in pattern.yaml
+        csv_generator.generate_custom_csvs(
+            results, csv_directives, _chip_name, _hierarchy, ordered_pat_names
+        )
+
+        # Generate HTML status pages that mirror the custom CSVs
+        csv_generator.generate_custom_htmls(
+            results, csv_directives, _chip_name, _hierarchy, ordered_pat_names
+        )
+
     print(f"\nReport generation complete!")
     print(f"Summary:")
     for result in results:
