@@ -5,9 +5,7 @@
 # Default run type
 type: "rtl_syn"
 
-block_subblock_config:
-  scpw: scu
-  upaw: ucb
+skylp_config_yaml: "/proj/pd/work/hitesh/REL/SKYLP/SCRIPTS/v21.03.2026/skylp_synth_data_roll_up/skylp.config.yaml"
 
 # Run type specific configurations
 rtl_syn:

@@ -62,15 +62,56 @@ def load_config(config_path):
     # Extract default type
     default_type = cfg.get('type', 'rtl_syn')
     
+    skylp_config_path = cfg.get('skylp_config_yaml', '')
+    skylp_config_data = {}
+    if skylp_config_path:
+        if os.path.isfile(skylp_config_path):
+            with open(skylp_config_path, 'r') as _sf:
+                skylp_config_data = yaml.safe_load(_sf) or {}
+            print(f"Loaded skylp config from: {skylp_config_path}")
+        else:
+            print(f"WARNING: skylp_config_yaml not found: {skylp_config_path}")
+
     config = {
         'type': default_type,
         'rtl_syn': cfg.get('rtl_syn', {}),
         'rtl_rtl': cfg.get('rtl_rtl', {}),
         'syn_pnr': cfg.get('syn_pnr', {}),
-        'block_subblock_config': cfg.get('block_subblock_config', {})
+        'skylp_config_data': skylp_config_data
     }
     print(f"Config loaded with default type: {default_type}")
     return config
+
+
+def find_flist_for_block(block_name, skylp_config_data):
+    """
+    Search the skylp.config.yaml hierarchy to find the flist string for block_name.
+    Returns (flist_str, wrapper_name) e.g. ('ucb.synth.flist VAR=upa CHIPLET=skylp WRAP=1', 'upaw')
+    or None if not found.
+    The wrapper_name is the key under cf_xxx.instances and is the name used by make for the
+    output file (e.g. make produces upaw.synth.flist, not ucb.synth.flist).
+    Matches either the wrapper name directly or any sub-instance of a wrapper.
+    """
+    top = skylp_config_data.get('skylp', {})
+    for cf_name, cf_data in top.items():
+        if not isinstance(cf_data, dict):
+            continue
+        instances = cf_data.get('instances', {}) or {}
+        for wrapper_name, wrapper_data in instances.items():
+            flist_str = None
+            if isinstance(wrapper_data, dict):
+                flist_str = wrapper_data.get('flist')
+            if not flist_str:
+                continue
+            # Direct match on the wrapper itself
+            if wrapper_name == block_name:
+                return (flist_str, wrapper_name)
+            # Match on any sub-instance of this wrapper
+            if isinstance(wrapper_data, dict):
+                sub_instances = wrapper_data.get('instances', {}) or {}
+                if block_name in sub_instances:
+                    return (flist_str, wrapper_name)
+    return None
 
 
 def find_block(base_path, block_name, location_override=None):
@@ -175,7 +216,7 @@ def dump_info_yaml(run_dir, info):
         logging.warning(f"Failed to write info.yaml: {e}")
 
 
-def generate_flist_from_tag(tag_name, block_name, golden_releases_location, golden_release_block, work_dir=None, flist_type='synth'):
+def generate_flist_from_tag(tag_name, block_name, golden_releases_location, golden_release_block, work_dir=None, flist_type='synth', make_target_str=None, expected_filename=None):
     """
     Generate flist file from a tag in golden releases.
     
@@ -186,9 +227,16 @@ def generate_flist_from_tag(tag_name, block_name, golden_releases_location, gold
         golden_release_block: Block directory (e.g., SKYLP)
         work_dir: Working directory to create flist (default: current directory)
         flist_type: Flist type suffix, e.g. 'synth' or 'fast_synth' (default: 'synth')
+        make_target_str: Full make target string from skylp config
+                         (e.g. 'ucb.synth.flist VAR=upa CHIPLET=skylp WRAP=1').
+                         If provided, overrides the default '{block_name}.{flist_type}.flist' target.
+        expected_filename: Actual filename that make will produce on disk
+                           (e.g. 'upaw.synth.flist' — named after the wrapper, not the IP).
+                           If omitted, falls back to the first word of make_target_str or
+                           '{block_name}.{flist_type}.flist'.
     
     Returns:
-        Path to generated <flist_type>.flist file
+        Path to generated flist file
     """
     if work_dir is None:
         work_dir = os.getcwd()
@@ -231,15 +279,25 @@ def generate_flist_from_tag(tag_name, block_name, golden_releases_location, gold
     
     # Run make command to generate flist
     repo_root = tag_path
-    flist_target = f"{block_name}.{flist_type}.flist"
-    
+    if make_target_str:
+        full_make_args = make_target_str             # e.g. 'ucb.synth.flist VAR=upa CHIPLET=skylp WRAP=1'
+    else:
+        full_make_args = f"{block_name}.{flist_type}.flist"
+    # The file make actually writes to disk may differ from the make target name.
+    # expected_filename (e.g. 'upaw.synth.flist') takes priority; fall back to
+    # the first word of full_make_args.
+    if expected_filename:
+        flist_target = expected_filename
+    else:
+        flist_target = full_make_args.split()[0]
+
     logging.info(f"Running make command to generate {flist_target}")
     logging.info(f"  REPO_ROOT={repo_root}")
     logging.info(f"  Working directory: {gen_flist_dir}")
     
     try:
         # Construct the make command as a string for shell execution
-        make_command = f"make REPO_ROOT={repo_root} {flist_target}"
+        make_command = f"make REPO_ROOT={repo_root} {full_make_args}"
         logging.info(f"Executing command: {make_command}")
         
         result = subprocess.run(
@@ -283,7 +341,7 @@ def generate_flist_from_tag(tag_name, block_name, golden_releases_location, gold
         return None
 
 
-def resolve_flist_file(flist_arg, block_name, type_config, work_dir=None):
+def resolve_flist_file(flist_arg, block_name, type_config, work_dir=None, skylp_config_data=None):
     """
     Resolve flist file - either use provided file or generate from tag.
     
@@ -292,6 +350,7 @@ def resolve_flist_file(flist_arg, block_name, type_config, work_dir=None):
         block_name: Block name for make command
         type_config: Configuration dictionary for run type
         work_dir: Working directory (default: current directory)
+        skylp_config_data: Parsed skylp.config.yaml data for flist target lookup
     
     Returns:
         Path to flist file, or None if not found/generated
@@ -326,7 +385,30 @@ def resolve_flist_file(flist_arg, block_name, type_config, work_dir=None):
     if not golden_releases_location:
         logging.error(f"Golden releases location not configured in type config")
         return None
-    
+
+    # Look up block in skylp config to get the proper make target with extra args
+    make_target_str = None
+    expected_filename = None
+    if skylp_config_data:
+        result = find_flist_for_block(block_name, skylp_config_data)
+        if result:
+            flist_str, wrapper_name = result
+            # flist_str e.g. 'ucb.synth.flist VAR=upa CHIPLET=skylp WRAP=1'
+            # Substitute the type segment (e.g. synth->sim) to match flist_type
+            parts = flist_str.split()
+            flist_file = parts[0]              # e.g. 'ucb.synth.flist'
+            extra_args = ' '.join(parts[1:])   # e.g. 'VAR=upa CHIPLET=skylp WRAP=1'
+            flist_base = flist_file.split('.')[0]  # e.g. 'ucb'
+            new_flist_file = f"{flist_base}.{flist_type}.flist"
+            make_target_str = f"{new_flist_file} {extra_args}".strip()
+            # Make produces the output file named after the wrapper, not the IP prefix
+            expected_filename = f"{wrapper_name}.{flist_type}.flist"
+            logging.info(f"skylp config flist for '{block_name}': {flist_str}")
+            logging.info(f"Using make args: {make_target_str}")
+            logging.info(f"Expected output file: {expected_filename}")
+        else:
+            logging.warning(f"Block '{block_name}' not found in skylp config; using default make target")
+
     # Try to generate flist from tag
     generated_flist = generate_flist_from_tag(
         tag_name,
@@ -334,7 +416,9 @@ def resolve_flist_file(flist_arg, block_name, type_config, work_dir=None):
         golden_releases_location,
         golden_release_block,
         work_dir,
-        flist_type=flist_type
+        flist_type=flist_type,
+        make_target_str=make_target_str,
+        expected_filename=expected_filename
     )
     
     return generated_flist
@@ -692,11 +776,6 @@ def main():
 
     config = load_config(config_path)
 
-    _subblock_map = config.get('block_subblock_config', {})
-    flist_block_name = _subblock_map.get(args.block_name, args.block_name)
-    if flist_block_name != args.block_name:
-        print(f"Note: block_subblock_config maps '{args.block_name}' -> '{flist_block_name}' for flist generation")
-
     # Determine the run type
     run_type = args.type if args.type else config.get('type')
     
@@ -764,8 +843,8 @@ def main():
         
         # Resolve flist files - check if they're files or tags
         # Pass block_dir so generate_flist directory is created inside it
-        resolved_golden = resolve_flist_file(golden_flist, flist_block_name, config.get('rtl_rtl', {}), block_dir)
-        resolved_revised = resolve_flist_file(revised_flist, flist_block_name, config.get('rtl_rtl', {}), block_dir)
+        resolved_golden = resolve_flist_file(golden_flist, args.block_name, config.get('rtl_rtl', {}), block_dir, skylp_config_data=config.get('skylp_config_data', {}))
+        resolved_revised = resolve_flist_file(revised_flist, args.block_name, config.get('rtl_rtl', {}), block_dir, skylp_config_data=config.get('skylp_config_data', {}))
         
         if not resolved_golden:
             logging.error(f"Golden flist could not be resolved: {golden_flist}")
@@ -804,7 +883,7 @@ def main():
             _write_refire(run_dir_base)
             
             # Resolve golden flist from tag or file
-            resolved_golden = resolve_flist_file(golden_tag, flist_block_name, type_config, flist_gen_dir)
+            resolved_golden = resolve_flist_file(golden_tag, args.block_name, type_config, flist_gen_dir, skylp_config_data=config.get('skylp_config_data', {}))
             if not resolved_golden:
                 logging.error(f"Golden flist could not be resolved: {golden_tag}")
                 sys.exit(1)
