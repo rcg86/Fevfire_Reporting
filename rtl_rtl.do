@@ -1,4 +1,8 @@
 tclmode
+set x [lindex [split [get_version] " "] 0]
+set y [clock format [clock seconds] -format {%b%d_%H:%M:%S}]
+set_log_file ${top_name}_${x}_${y}.log
+
 
 file mkdir reports
 #**************************************************************************
@@ -24,9 +28,6 @@ file mkdir reports
 # Sets up the log file and instructs the tool to display usage information
 #**************************************************************************
 #set_log_file rtl2rtl.log_$env(LEC_VERSION) -replace
-set x [lindex [split [get_version] " "] 0]
-set y [clock format [clock seconds] -format {%b%d_%H:%M:%S}]
-set_log_file ${top_name}_${x}_${y}.log
 usage -auto -elapse
 
 #**************************************************************************
@@ -120,6 +121,15 @@ elaborate_design -root $top_name -golden -rootonly
 read_design -enumconstraint -define SYNTHESIS  -merge bbox -revised -lastmod -noelab  -sv09 -f $revisedFlist
 elaborate_design -root $top_name -revised -rootonly
 
+##### modelling section
+set_flatten_model -seq_constant
+
+#### additional block level constraints
+
+source -echo -verbose [file dirname [file normalize [info script]]]/constraints/rtl_rtl/${top_name}/${top_name}.con
+
+#####
+
 report_design_data > reports/report_design_data.rpt
 report_black_box -detail > reports/report_black_box.rpt
 
@@ -137,14 +147,14 @@ set_x_conversion E -both
 # Generates the hierarchical dofile script for hierarchical comparison
 #**************************************************************************
 write_hier_compare_dofile hier_r2r.do -replace -usage \
-  -prepend_string "report_design_data; usage ; analyze_datapath -verbose"
+  -prepend_string "report_design_data; usage ; report_unmapped_points -summary; report_unmapped_points -notmapped; analyze_datapath -module -verbose; analyze_datapath -verbose"
 
 #************************************************************************
 # Executes the hier.do script
 #**************************************************************************
-run_hier_compare hier_r2r.do -nodynamic
+run_hier_compare hier_r2r.do -dynamic_hierarchy
 
-if {[get_compare_points -NONequivalent -count] > 0 } {
+if {{[get_compare_points -NONequivalent -count] > 0} || {[get_compare_points -abort -count] > 0 }} {
     checkpoint debugCheckPoint
 }
 
