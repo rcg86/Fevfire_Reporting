@@ -699,6 +699,21 @@ def run_rtl_syn(resolved, block_path, no_exec=False, pre_created_run_dir=False):
                     modified_lines.append("    checkpoint debugCheckPoint -replace")
                     modified_lines.append("}")
                     logging.info(f"Inserted checkpoint commands after run_hier_compare")
+
+                # Inject block-specific constraints after read_design -revised
+                if 'read_design' in line and '-revised' in line:
+                    con_block = (
+                        "\n#### additional block level constraints\n"
+                        "set _con_file [file dirname [file normalize [info script]]]/constraints/rtl_rtl/${top_name}/${top_name}.con\n"
+                        "if {[file exists $_con_file]} {\n"
+                        "    puts \"INFO: Block-specific constraints file found for ${top_name} \u2014 loading constraints: $_con_file\"\n"
+                        "    source -echo -verbose $_con_file\n"
+                        "} else {\n"
+                        "    puts \"INFO: No block-specific constraints file found for ${top_name} (looked for: $_con_file) \u2014 skipping.\"\n"
+                        "}"
+                    )
+                    modified_lines.append(con_block)
+                    logging.info("Injected block-specific constraints block after read_design -revised")
             
             new_content = header + '\n'.join(modified_lines)
             

@@ -110,6 +110,24 @@ set_hdl_option -v_to_vd on
 add_search_path . -design -both
 
 
+set _con_file [file dirname [file normalize [info script]]]/constraints/rtl_rtl/common_library.tcl
+if {[file exists $_con_file]} {
+    puts "INFO: common library file found for ${top_name} — loading constraints: $_con_file"
+    source -echo -verbose $_con_file
+} else {
+    puts "INFO: No common library file found for ${top_name} (looked for: $_con_file) — skipping."
+}
+
+### block specfic library
+
+set _con_file [file dirname [file normalize [info script]]]/constraints/rtl_rtl/${top_name}/${top_name}_library.tcl
+if {[file exists $_con_file]} {
+    puts "INFO: Block-specific constraints file found for ${top_name} — loading constraints: $_con_file"
+    source -echo -verbose $_con_file
+} else {
+    puts "INFO: No block-specific constraints file found for ${top_name} (looked for: $_con_file) — skipping."
+}
+
 
 
 #**************************************************************************
@@ -126,7 +144,22 @@ set_flatten_model -seq_constant
 
 #### additional block level constraints
 
-source -echo -verbose [file dirname [file normalize [info script]]]/constraints/rtl_rtl/${top_name}/${top_name}.con
+set _con_file [file dirname [file normalize [info script]]]/constraints/rtl_rtl/common.con
+if {[file exists $_con_file]} {
+    puts "INFO: common constraints file found for ${top_name} — loading constraints: $_con_file"
+    source -echo -verbose $_con_file
+} else {
+    puts "INFO: No common constraints file found for ${top_name} (looked for: $_con_file) — skipping."
+}
+
+
+set _con_file [file dirname [file normalize [info script]]]/constraints/rtl_rtl/${top_name}/${top_name}.con
+if {[file exists $_con_file]} {
+    puts "INFO: Block-specific constraints file found for ${top_name} — loading constraints: $_con_file"
+    source -echo -verbose $_con_file
+} else {
+    puts "INFO: No block-specific constraints file found for ${top_name} (looked for: $_con_file) — skipping."
+}
 
 #####
 

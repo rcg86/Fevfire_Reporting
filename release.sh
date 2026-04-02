@@ -174,6 +174,16 @@ else
     echo -e "${YELLOW}  ℹ No *.do files found; skipping.${NC}"
 fi
 
+if [[ -d "${SOURCE_DIR}/constraints" ]]; then
+    cp -r "${SOURCE_DIR}/constraints" "${RELEASE_DIR}/constraints"
+    echo -e "${GREEN}  ✔ Copied constraints directory:${NC}"
+    find "${RELEASE_DIR}/constraints" -type f | sort | while read -r f; do
+        echo -e "     - constraints/${f#${RELEASE_DIR}/constraints/}"
+    done
+else
+    echo -e "${YELLOW}  ℹ No constraints directory found; skipping.${NC}"
+fi
+
 SH_FILES=()
 while IFS= read -r -d '' f; do
     [[ "$(basename "$f")" == "release.sh" ]] && continue
