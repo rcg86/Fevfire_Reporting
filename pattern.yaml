@@ -26,6 +26,7 @@ error_patterns:
   - 'FAILED'
   - 'FATAL'
   - 'Comparison\s+FAILED'
+  - 'Error exit from dofile'
 
 # Warning patterns - Lines matching these will be flagged as warnings (ORANGE)
 warning_patterns:

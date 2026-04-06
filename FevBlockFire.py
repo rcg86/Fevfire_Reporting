@@ -516,7 +516,7 @@ echo "Running rtl_rtl for {resolved["block_name"]}"
 echo "DO file: {rtl_rtl_do_name}"
 echo "Log file: {logfile_name}"
 
-blaunch --cpus 8 --mem 64 -L confrml:1 --jobname {jobname} --mail -L confrml launch -c cdns/confrml@25.20-w228 -- lec -nogui -lp -xl -dofile {rtl_rtl_do_name} -logfile {logfile_name}
+blaunch --cpus 8 --mem 64 -L confrml:1 --jobname {jobname} --mail -L confrml launch -c cdns/confrml@25.20-w228 -- lec -nogui -lp -xl -dofile {rtl_rtl_do_name} -logfile {logfile_name} >> job_id.list
 '''
     script = generate_run_script(run_dir, resolved['block_name'], 'rtl_rtl', sh_cmds)
     dump_info_yaml(run_dir, info)
@@ -573,7 +573,7 @@ def run_rtl_syn(resolved, block_path, no_exec=False, pre_created_run_dir=False):
                 content = f.read()
             
             stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            header = f"tclmode \n\n// Modified by FevBlockFire on {stamp}\nset RUN_DIR \"{run_dir}\"\nfile mkdir reports\n// Original source: {block_path}\n"
+            header = f"tclmode \n\n// Modified by FevBlockFire on {stamp}\nset RUN_DIR \"{run_dir}\"\nset top_name {resolved['block_name']}\nfile mkdir reports\n// Original source: {block_path}\n"
             
             # Add golden_flist variable if provided
             if resolved.get('golden_flist'):
@@ -706,10 +706,10 @@ def run_rtl_syn(resolved, block_path, no_exec=False, pre_created_run_dir=False):
                         "\n#### additional block level constraints\n"
                         "set _con_file [file dirname [file normalize [info script]]]/constraints/rtl_rtl/${top_name}/${top_name}.con\n"
                         "if {[file exists $_con_file]} {\n"
-                        "    puts \"INFO: Block-specific constraints file found for ${top_name} \u2014 loading constraints: $_con_file\"\n"
+                        "    puts \"INFO: Block-specific constraints file found for ${top_name} loading constraints: $_con_file\"\n"
                         "    source -echo -verbose $_con_file\n"
                         "} else {\n"
-                        "    puts \"INFO: No block-specific constraints file found for ${top_name} (looked for: $_con_file) \u2014 skipping.\"\n"
+                        "    puts \"INFO: No block-specific constraints file found for ${top_name} (looked for: $_con_file) skipping.\"\n"
                         "}"
                     )
                     modified_lines.append(con_block)
@@ -736,7 +736,7 @@ echo "FV folder: {target_fv}"
 echo "DO file: {do_file}"
 echo "Log file: {logfile_name}"
 
-blaunch --cpus 8 --mem 64 -L confrml:1 --jobname {jobname} --mail -L confrml launch -c cdns/confrml@25.20-w228 -- lec -nogui -lp -xl -dofile {do_file} -logfile {logfile_name}
+blaunch --cpus 8 --mem 64 -L confrml:1 --jobname {jobname} --mail -L confrml launch -c cdns/confrml@25.20-w228 -- lec -nogui -lp -xl -dofile {do_file} -logfile {logfile_name} >> job_id.list
 '''
     script = generate_run_script(run_dir, resolved['block_name'], 'rtl_syn', sh_cmds)
     dump_info_yaml(run_dir, info)
@@ -778,6 +778,7 @@ def main():
     parser.add_argument('--run_location', help="path where lec run gets executed (overrides config)")
     parser.add_argument('--config', help="Path to YAML config (defaults to fevConfig.yaml in fevFireRuns)")
     parser.add_argument('--no_exec', action='store_true', help="Create .sh but do NOT execute it")
+    parser.add_argument('--no_upf', action='store_true', help='Comment out read_power_intent commands in the do file (applies to all run types)')
     parser.add_argument('--golden_flist', type=str, help='Golden flist file path or tag (e.g., SKYLP_G0550). Applies to rtl_rtl, rtl_syn, syn_pnr')
     parser.add_argument('--revised_flist', type=str, help='Revised flist file path or tag (rtl_rtl only)')
     args = parser.parse_args()
@@ -806,7 +807,7 @@ def main():
         'type': run_type,
         'location': args.location if args.location else type_config.get('location'),
         'run_location': args.run_location if args.run_location else type_config.get('run_location'),
-        'read_upf': type_config.get('read_upf', True),
+        'read_upf': False if args.no_upf else type_config.get('read_upf', True),
         'rtl_rtl_do': type_config.get('rtl_rtl_do'),
         'golden_upf_location': type_config.get('golden_upf_location', '')
     }
