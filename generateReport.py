@@ -17,6 +17,10 @@ import glob
 import yaml
 import csv
 import copy
+import json
+import threading
+import http.server
+import urllib.parse
 from datetime import datetime
 from pathlib import Path
 
@@ -1978,7 +1982,7 @@ class CSVReportGenerator:
                 .replace('"', '&quot;'))
 
     def generate_custom_htmls(self, block_results, csv_directives, chip_name, hierarchy,
-                               ordered_pattern_names):
+                               ordered_pattern_names, comments=None, port=8765):
         """Generate an HTML status page for every ``csv:`` directive in pattern.yaml.
 
         For each ``csv: 'xxx.csv'`` directive a parallel ``xxx.html`` is written
@@ -2045,13 +2049,17 @@ class CSVReportGenerator:
 
             out_path = os.path.join(self.output_dir, html_filename)
             try:
-                self._write_status_html(out_path, html_filename, headers, rows)
+                self._write_status_html(out_path, html_filename, headers, rows,
+                                        comments=comments or {}, port=port)
                 print(f"Status HTML generated: {out_path}")
             except Exception as e:
                 print(f"Error generating status HTML '{html_filename}': {e}")
 
-    def _write_status_html(self, out_path, title, headers, rows):
+    def _write_status_html(self, out_path, title, headers, rows, comments=None, port=8765):
         """Render *rows* as a styled, sortable, filterable single-page HTML table."""
+        comments = comments or {}
+        _save_path  = str(comments_file_path(self.output_dir))
+        _server_url = f'http://localhost:{port}/api/save_comments'
         header_lower = [h.lower().strip() for h in headers]
 
         # Identify special columns by name for automatic colour-coding
@@ -2138,6 +2146,19 @@ class CSVReportGenerator:
         lines.append('    td.wrap{white-space:normal;max-width:420px;word-break:break-all;}')
         lines.append('    .hidden{display:none!important;}')
         lines.append('    #rowCount{font-size:.85em;color:#666;}')
+        lines.append('    .comment-box{width:100%;min-width:180px;box-sizing:border-box;border:1px solid #ccc;border-radius:4px;padding:4px 6px;font-size:.85em;font-family:inherit;resize:vertical;background:#fffde7;}')
+        lines.append('    .comment-box:focus{outline:none;border-color:#007acc;background:#fff;}')
+        lines.append('    .action-btn{padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:.88em;font-weight:bold;}')
+        lines.append('    .btn-save{background:#43a047;color:white;}')
+        lines.append('    .btn-save:hover{background:#2e7d32;}')
+        lines.append('    .btn-load{background:#6a1b9a;color:white;}')
+        lines.append('    .btn-load:hover{background:#4a0072;}')
+        lines.append('    .user-status-sel{width:100%;padding:2px 4px;font-size:.82em;border-radius:3px;border:1px solid #ccc;cursor:pointer;}')
+        lines.append('    .us-error{background:#ffcdd2;}')
+        lines.append('    .us-warning{background:#fff9c4;}')
+        lines.append('    .us-clean{background:#c8e6c9;}')
+        lines.append('    .us-known{background:#ffe0b2;}')
+        lines.append('    #toast{position:fixed;bottom:24px;right:24px;background:#323232;color:white;padding:10px 20px;border-radius:6px;font-size:.9em;display:none;z-index:9999;}')
         lines.append('  </style>')
         lines.append('</head>')
         lines.append('<body>')
@@ -2154,20 +2175,35 @@ class CSVReportGenerator:
         lines.append('    </label>')
         lines.append('    <div class="stats" id="statsBar"></div>')
         lines.append('    <span id="rowCount"></span>')
+        lines.append('    <button class="action-btn btn-save" onclick="saveCommentsJSON()">&#128190; Save Comments</button>')
+        lines.append('    <button class="action-btn btn-load" onclick="loadCommentsJSON()">&#128196; Load Comments</button>')
+        lines.append('    <button class="action-btn btn-export" onclick="exportCommentsCSV()">&#128196; Export CSV</button>')
+        lines.append('    <input type="file" id="commentFileInput" accept=".json" style="display:none" onchange="_onCommentFileChosen(event)">')
         lines.append('  </div>')
+        lines.append('  <div id="toast"></div>')
 
         # ── Table ─────────────────────────────────────────────────────────────
         lines.append('  <table id="statusTable">')
+        notes_col_idx = len(headers)  # Notes column appended after all data columns
         lines.append('    <thead><tr>')
         for i, h in enumerate(headers):
             lines.append(f'      <th onclick="sortTable({i})" data-col="{i}">'
                          f'{self._html_escape(h)} <span class="sort-arrow" id="arrow_{i}">\u21c5</span></th>')
+        lines.append(f'      <th data-col="{notes_col_idx}">Notes</th>')
         lines.append('    </tr></thead>')
         lines.append('    <tbody id="tableBody">')
 
         long_col_start = max(0, len(headers) - 4)   # last few columns wrap (paths)
         for row_data in rows:
+            # block_name is always column 0 (per pattern.yaml cols: definition)
+            block_key = str(row_data[0]) if row_data else ''
+            pre_comment = self._html_escape(
+                (comments.get(block_key) or {}).get('comment', '')
+            )
+            pre_status = (comments.get(block_key) or {}).get('user_status', '')
             lines.append('      <tr>')
+            _us_color_map = {'user Error': '#ffcdd2', 'user Warning': '#fff9c4',
+                              'user clean': '#c8e6c9', 'user known issue': '#ffe0b2'}
             for ci, val in enumerate(row_data):
                 style = _cell_style(ci, val)
                 wrap = ' class="wrap"' if ci >= long_col_start else ''
@@ -2176,16 +2212,52 @@ class CSVReportGenerator:
                 if isinstance(display, str) and display.startswith('data: '):
                     keyword = display[6:].strip().title()
                     display = f'Not Completed \u2014 {keyword}'
-                lines.append(f'        <td style="{style}"{wrap}>{self._html_escape(display)}</td>')
+                if ci == status_col:
+                    # Status column: show original run value + editable user dropdown
+                    _so = ''.join(
+                        f'<option value="{v}"{" selected" if pre_status == v else ""}>{lbl}</option>'
+                        for v, lbl in [
+                            ('', '\u2014 (run status) \u2014'),
+                            ('user Error', 'user Error'),
+                            ('user Warning', 'user Warning'),
+                            ('user clean', 'user clean'),
+                            ('user known issue', 'user known issue'),
+                        ]
+                    )
+                    _bg = _us_color_map.get(pre_status, '')
+                    _td_style = f'background:{_bg};padding:4px 8px;' if _bg else f'{style}padding:4px 8px;'
+                    lines.append(
+                        f'        <td style="{_td_style}"{wrap}>'
+                        f'<small style="color:#555;display:block;margin-bottom:3px">{self._html_escape(display)}</small>'
+                        f'<select class="user-status-sel" data-block="{self._html_escape(block_key)}"'
+                        f' onchange="_updateStatusColor(this)">{_so}</select></td>'
+                    )
+                else:
+                    lines.append(f'        <td style="{style}"{wrap}>{self._html_escape(display)}</td>')
+            # Notes textarea — pre-populated from block_comments.json
+            lines.append(
+                f'        <td style="padding:4px 8px;white-space:normal;min-width:200px;">'
+                f'<textarea class="comment-box" data-block="{self._html_escape(block_key)}"'
+                f' rows="2">{pre_comment}</textarea></td>'
+            )
             lines.append('      </tr>')
 
         lines.append('    </tbody>')
         lines.append('  </table>')
 
         # ── JavaScript ────────────────────────────────────────────────────────
+        comments_init_js = json.dumps(
+            {k: {'comment': v.get('comment', '') if isinstance(v, dict) else str(v),
+                 'user_status': v.get('user_status', '') if isinstance(v, dict) else ''}
+             for k, v in comments.items()},
+            ensure_ascii=False
+        )
         lines.append('  <script>')
         lines.append('    var _sortState = {col: -1, asc: true};')
         lines.append(f'   var STATUS_COL = {status_col_js};')
+        lines.append(f'   var COMMENTS_INIT = {comments_init_js};')
+        lines.append(f'   var COMMENTS_SERVER_URL = {json.dumps(_server_url)};')
+        lines.append(f'   var COMMENTS_SAVE_PATH  = {json.dumps(_save_path)};')
         lines.append('')
         lines.append('    function applyFilters() {')
         lines.append('      var text   = document.getElementById("filterInput").value.toLowerCase();')
@@ -2247,7 +2319,171 @@ class CSVReportGenerator:
         lines.append('        \'<span class="stat-badge stat-total">Total: \' + (pass+fail) + \'</span>\';')
         lines.append('    }')
         lines.append('')
-        lines.append('    window.onload = function(){ applyFilters(); };')
+        lines.append('    function showToast(msg) {')
+        lines.append('      var t = document.getElementById("toast");')
+        lines.append('      t.textContent = msg; t.style.display = "block";')
+        lines.append('      setTimeout(function(){ t.style.display = "none"; }, 2500);')
+        lines.append('    }')
+        lines.append('')
+        lines.append('    function _updateStatusColor(sel) {')
+        lines.append('      var td = sel.closest("td");')
+        lines.append('      var map = {"user Error":"#ffcdd2","user Warning":"#fff9c4","user clean":"#c8e6c9","user known issue":"#ffe0b2"};')
+        lines.append('      if (td) td.style.background = map[sel.value] || "";')
+        lines.append('    }')
+        lines.append('')
+        lines.append('    function _applyCommentData(data) {')
+        lines.append('      var count = 0;')
+        lines.append('      document.querySelectorAll(".comment-box").forEach(function(ta) {')
+        lines.append('        var blk = ta.getAttribute("data-block");')
+        lines.append('        if (blk && data[blk] !== undefined) {')
+        lines.append('          ta.value = (typeof data[blk] === "object") ? (data[blk].comment || "") : data[blk];')
+        lines.append('          count++;')
+        lines.append('        }')
+        lines.append('      });')
+        lines.append('      document.querySelectorAll(".user-status-sel").forEach(function(sel) {')
+        lines.append('        var blk = sel.getAttribute("data-block");')
+        lines.append('        if (blk && data[blk] !== undefined && typeof data[blk] === "object") {')
+        lines.append('          sel.value = data[blk].user_status || "";')
+        lines.append('          _updateStatusColor(sel);')
+        lines.append('        }')
+        lines.append('      });')
+        lines.append('      showToast("Loaded comments for " + count + " block(s).");')
+        lines.append('    }')
+        lines.append('')
+        lines.append('    function loadCommentsJSON() {')
+        lines.append('      // Try server first; fall back to file picker')
+        lines.append('      var apiUrl = COMMENTS_SERVER_URL.replace("/api/save_comments", "/api/comments");')
+        lines.append('      fetch(apiUrl)')
+        lines.append('        .then(function(r){ return r.ok ? r.json() : Promise.reject(); })')
+        lines.append('        .then(function(data) { _applyCommentData(data); })')
+        lines.append('        .catch(function() {')
+        lines.append('          // Server not running — open file picker')
+        lines.append('          var inp = document.getElementById("commentFileInput");')
+        lines.append('          inp.value = "";  // reset so same file can be reloaded')
+        lines.append('          inp.click();')
+        lines.append('        });')
+        lines.append('    }')
+        lines.append('')
+        lines.append('    function _onCommentFileChosen(evt) {')
+        lines.append('      var file = evt.target.files[0];')
+        lines.append('      if (!file) return;')
+        lines.append('      var reader = new FileReader();')
+        lines.append('      reader.onload = function(e) {')
+        lines.append('        try {')
+        lines.append('          var data = JSON.parse(e.target.result);')
+        lines.append('          _applyCommentData(data);')
+        lines.append('        } catch(err) {')
+        lines.append('          showToast("Error: could not parse JSON file.");')
+        lines.append('        }')
+        lines.append('      };')
+        lines.append('      reader.readAsText(file);')
+        lines.append('    }')
+        lines.append('')
+        lines.append('    function saveCommentsJSON() {')
+        lines.append('      var now = new Date().toISOString();')
+        lines.append('      var data = {};')
+        lines.append('      document.querySelectorAll(".comment-box").forEach(function(ta) {')
+        lines.append('        var blk = ta.getAttribute("data-block");')
+        lines.append('        if (blk) data[blk] = {comment: ta.value, saved_at: now, user_status: ""};')
+        lines.append('      });')
+        lines.append('      document.querySelectorAll(".user-status-sel").forEach(function(sel) {')
+        lines.append('        var blk = sel.getAttribute("data-block");')
+        lines.append('        if (blk && data[blk]) data[blk].user_status = sel.value;')
+        lines.append('      });')
+        lines.append('      var payload = JSON.stringify(data, null, 2);')
+        lines.append('      // Try to save directly to filesystem via local server ----------')
+        lines.append('      fetch(COMMENTS_SERVER_URL, {')
+        lines.append('        method: "POST",')
+        lines.append('        headers: {"Content-Type": "application/json"},')
+        lines.append('        body: payload')
+        lines.append('      }).then(function(r) {')
+        lines.append('        if (r.ok) {')
+        lines.append('          showToast("Saved to: " + COMMENTS_SAVE_PATH);')
+        lines.append('        } else {')
+        lines.append('          throw new Error("server returned " + r.status);')
+        lines.append('        }')
+        lines.append('      }).catch(function() {')
+        lines.append('        // Fall back: download to browser Downloads folder ----------')
+        lines.append('        var blob = new Blob([payload], {type: "application/json"});')
+        lines.append('        var a = document.createElement("a");')
+        lines.append('        a.href = URL.createObjectURL(blob);')
+        lines.append('        a.download = "block_comments.json";')
+        lines.append('        a.click();')
+        lines.append('        showToast("Server not running — downloaded to Downloads. Place at: " + COMMENTS_SAVE_PATH);')
+        lines.append('      });')
+        lines.append('    }')
+        lines.append('')
+        lines.append('    function csvEscape(val) {')
+        lines.append('      var s = (val === null || val === undefined) ? "" : String(val);')
+        lines.append('      if (s.indexOf(",") !== -1 || s.indexOf("\\n") !== -1 || s.indexOf(\'\"\') !== -1) {')
+        lines.append('        return \'"\' + s.replace(/"/g, \'\"\"\') + \'"\';')
+        lines.append('      }')
+        lines.append('      return s;')
+        lines.append('    }')
+        lines.append('')
+        lines.append('    function exportCommentsCSV() {')
+        lines.append('      var thead = document.querySelector("#statusTable thead tr");')
+        lines.append('      var thCells = thead ? Array.from(thead.querySelectorAll("th")) : [];')
+        lines.append('      var headerRow = thCells.map(function(th) {')
+        lines.append('        return csvEscape(th.textContent.replace(/[\u21c5\u2191\u2193]/g, "").trim());')
+        lines.append('      }).join(",");')
+        lines.append('      var csvRows = [headerRow];')
+        lines.append('      var tbody = document.getElementById("tableBody");')
+        lines.append('      var rows = tbody ? Array.from(tbody.querySelectorAll("tr:not(.hidden)")) : [];')
+        lines.append('      rows.forEach(function(row) {')
+        lines.append('        var cells = Array.from(row.querySelectorAll("td"));')
+        lines.append('        var vals = cells.map(function(td) {')
+        lines.append('          var ta = td.querySelector(".comment-box");')
+        lines.append('          if (ta) return csvEscape(ta.value);')
+        lines.append('          var sel = td.querySelector(".user-status-sel");')
+        lines.append('          if (sel) { var sm = td.querySelector("small"); var rv = sm ? sm.textContent.trim() : ""; return csvEscape(sel.value ? sel.value : rv); }')
+        lines.append('          return csvEscape(td.textContent.trim());')
+        lines.append('        });')
+        lines.append('        csvRows.push(vals.join(","));')
+        lines.append('      });')
+        lines.append('      var ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);')
+        lines.append('      var blob = new Blob([csvRows.join("\\n")], {type: "text/csv"});')
+        lines.append('      var a = document.createElement("a");')
+        lines.append('      a.href = URL.createObjectURL(blob);')
+        lines.append('      a.download = "block_comments_" + ts + ".csv";')
+        lines.append('      a.click();')
+        lines.append('      showToast("CSV exported.");')
+        lines.append('    }')
+        lines.append('')
+        lines.append('    window.onload = function(){')
+        lines.append('      applyFilters();')
+        lines.append('      // Try to load latest comments from server; fall back to embedded COMMENTS_INIT')
+        lines.append('      var apiUrl = COMMENTS_SERVER_URL.replace("/api/save_comments", "/api/comments");')
+        lines.append('      fetch(apiUrl)')
+        lines.append('        .then(function(r){ return r.ok ? r.json() : Promise.reject(); })')
+        lines.append('        .then(function(data) {')
+        lines.append('          document.querySelectorAll(".comment-box").forEach(function(ta) {')
+        lines.append('            var blk = ta.getAttribute("data-block");')
+        lines.append('            if (blk && data[blk]) ta.value = data[blk].comment || data[blk];')
+        lines.append('          });')
+        lines.append('          document.querySelectorAll(".user-status-sel").forEach(function(sel) {')
+        lines.append('            var blk = sel.getAttribute("data-block");')
+        lines.append('            if (blk && data[blk] && typeof data[blk] === "object") {')
+        lines.append('              sel.value = data[blk].user_status || "";')
+        lines.append('              _updateStatusColor(sel);')
+        lines.append('            }')
+        lines.append('          });')
+        lines.append('        })')
+        lines.append('        .catch(function() {')
+        lines.append('          // Server not running — populate from embedded snapshot')
+        lines.append('          document.querySelectorAll(".comment-box").forEach(function(ta) {')
+        lines.append('            var blk = ta.getAttribute("data-block");')
+        lines.append('            if (blk && COMMENTS_INIT[blk]) ta.value = COMMENTS_INIT[blk].comment || COMMENTS_INIT[blk];')
+        lines.append('          });')
+        lines.append('          document.querySelectorAll(".user-status-sel").forEach(function(sel) {')
+        lines.append('            var blk = sel.getAttribute("data-block");')
+        lines.append('            if (blk && COMMENTS_INIT[blk] && typeof COMMENTS_INIT[blk] === "object") {')
+        lines.append('              sel.value = COMMENTS_INIT[blk].user_status || "";')
+        lines.append('              _updateStatusColor(sel);')
+        lines.append('            }')
+        lines.append('          });')
+        lines.append('        });')
+        lines.append('    };')
         lines.append('  </script>')
         lines.append('</body>')
         lines.append('</html>')
@@ -2614,6 +2850,124 @@ def find_all_blocks(run_location):
     return blocks
 
 
+def _make_comment_handler(run_location):
+    """Return a BaseHTTPRequestHandler subclass bound to run_location."""
+    _lock = threading.Lock()
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):
+            pass  # suppress per-request console noise
+
+        def _send(self, code, body=b'', ctype='application/json'):
+            self.send_response(code)
+            self.send_header('Content-Type', ctype)
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+            self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            if body:
+                self.wfile.write(body)
+
+        def do_OPTIONS(self):
+            self._send(204)
+
+        def do_GET(self):
+            path = urllib.parse.urlparse(self.path).path
+            if path in ('/', ''):
+                path = '/status.html'
+            if path == '/ping':
+                self._send(200, b'{"ok":true}')
+                return
+            if path == '/api/comments':
+                cpath = comments_file_path(run_location)
+                try:
+                    if cpath.is_file():
+                        with _lock:
+                            with open(cpath, 'r', encoding='utf-8') as fh:
+                                data = fh.read().encode('utf-8')
+                        self._send(200, data)
+                    else:
+                        self._send(200, b'{}')
+                except Exception as exc:
+                    self._send(500, json.dumps({'error': str(exc)}).encode())
+                return
+            local = os.path.join(run_location, path.lstrip('/'))
+            if os.path.isfile(local) and local.endswith('.html'):
+                with open(local, 'rb') as fh:
+                    data = fh.read()
+                self._send(200, data, 'text/html; charset=utf-8')
+            else:
+                self._send(404, b'{"error":"not found"}')
+
+        def do_POST(self):
+            path = urllib.parse.urlparse(self.path).path
+            if path == '/api/save_comments':
+                length = int(self.headers.get('Content-Length', 0))
+                body = self.rfile.read(length)
+                try:
+                    data = json.loads(body.decode('utf-8'))
+                    cpath = comments_file_path(run_location)
+                    with _lock:
+                        with open(cpath, 'w', encoding='utf-8') as fh:
+                            json.dump(data, fh, indent=2, ensure_ascii=False)
+                    resp = json.dumps({'ok': True, 'path': str(cpath)}).encode()
+                    self._send(200, resp)
+                    print(f"[comments] Saved {len(data)} block(s) to {cpath}")
+                except Exception as exc:
+                    self._send(500, json.dumps({'error': str(exc)}).encode())
+            else:
+                self._send(404, b'{"error":"unknown endpoint"}')
+
+    return _Handler
+
+
+def serve_mode(run_location, port):
+    """Start the minimal comment-save HTTP server and block until Ctrl-C."""
+    handler = _make_comment_handler(run_location)
+    server = http.server.HTTPServer(('localhost', port), handler)
+    cpath = comments_file_path(run_location)
+    sep = '=' * 62
+    print(f"\n{sep}")
+    print(f"  FEV Comment Server  →  http://localhost:{port}/status.html")
+    print(f"  Comments saved to   →  {cpath}")
+    print(f"  Press Ctrl+C to stop")
+    print(f"{sep}\n")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nServer stopped.")
+
+
+def comments_file_path(run_location):
+    """Return path to the persistent block_comments.json file.
+
+    Stored inside run_location (alongside the block dirs and HTML files).
+    Safe from rotation because rotate_and_create_run_dir only touches
+    run_location/<block_name>/ subdirs.
+    """
+    return Path(run_location) / 'block_comments.json'
+
+
+def load_comments(run_location):
+    """Load block comments from block_comments.json.
+
+    Returns a dict: {block_name: {"comment": str, "saved_at": str}}.
+    Returns {} if the file does not exist or cannot be parsed.
+    """
+    cpath = comments_file_path(run_location)
+    if not cpath.is_file():
+        return {}
+    try:
+        with open(cpath, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except Exception as e:
+        print(f"WARNING: Could not load comments from {cpath}: {e}")
+    return {}
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate HTML report from FEV block run logs")
     parser.add_argument('--run_location', help='Base directory containing block runs (default: current directory)')
@@ -2622,6 +2976,10 @@ def main():
     parser.add_argument('--pattern_file', help='Path to global pattern.yaml file')
     parser.add_argument('--only_status', action='store_true',
                         help='Only generate status.html (skips the main HTML report and CSV reports)')
+    parser.add_argument('--serve', action='store_true',
+                        help='Start a local server so Save Comments writes directly to the filesystem')
+    parser.add_argument('--port', type=int, default=8765,
+                        help='Port for the local comment server (default: 8765)')
     args = parser.parse_args()
 
     # Reject --output values that would collide with the auto-generated status.html
@@ -2639,6 +2997,11 @@ def main():
     if not os.path.isdir(run_location):
         print(f"ERROR: Run location does not exist: {run_location}")
         sys.exit(1)
+
+    # --serve: skip report generation entirely, just start the save server
+    if args.serve:
+        serve_mode(run_location, args.port)
+        sys.exit(0)
     
     # Load global pattern configuration
     global_pattern_config = None
@@ -2706,11 +3069,16 @@ def main():
 
     csv_generator = CSVReportGenerator(run_location)
 
+    # Load persistent block comments (stored one level above run_location)
+    comments = load_comments(run_location)
+    print(f"Loaded {len(comments)} saved comment(s) from {comments_file_path(run_location)}")
+
     if args.only_status:
         # Fast path: only generate status.html, skip everything else
         print("\nRunning in --only_status mode: generating status.html only.")
         csv_generator.generate_custom_htmls(
-            results, csv_directives, _chip_name, _hierarchy, ordered_pat_names
+            results, csv_directives, _chip_name, _hierarchy, ordered_pat_names,
+            comments=comments, port=args.port
         )
     else:
         # Generate HTML report
@@ -2732,7 +3100,8 @@ def main():
 
         # Generate HTML status pages that mirror the custom CSVs
         csv_generator.generate_custom_htmls(
-            results, csv_directives, _chip_name, _hierarchy, ordered_pat_names
+            results, csv_directives, _chip_name, _hierarchy, ordered_pat_names,
+            comments=comments, port=args.port
         )
 
     print(f"\nReport generation complete!")
@@ -2740,6 +3109,9 @@ def main():
     for result in results:
         status_label = HTMLReportGenerator.STATUS_LABELS[result['overall_status']]
         print(f"  {result['block_name']}: {status_label}")
+    print(f"\nTo save comments directly to the filesystem, start the local server:")
+    print(f"  python3 generateReport.py --serve --run_location {run_location} --port {args.port}")
+    print(f"  Then open: http://localhost:{args.port}/status.html")
 
 
 if __name__ == '__main__':
