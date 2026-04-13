@@ -1,0 +1,70 @@
+# If 'files' is omitted the script falls back to hardcoded defaults.
+files:
+  - "${block}/*synth.lint-*.out"
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Error patterns - Lines matching these will be flagged as errors (RED)
+error_patterns:
+  - '//\s+Error:'
+  - 'ERROR'
+  - 'parse error'
+  - 'FAILED'
+  - 'FATAL'
+  - 'Comparison\s+FAILED'
+  - 'Error'
+
+# Warning patterns - Lines matching these will be flagged as warnings (ORANGE)
+warning_patterns:
+  - 'WARNING'
+  - 'Warning'
+  - 'WARN'
+
+# Info patterns - Lines matching these will be flagged as info (YELLOW)
+info_patterns:
+  - 'Info'
+
+# Ignore error patterns - Error lines matching these will be ignored
+ignore_error:
+  - 'Expected error'
+
+# Ignore warning patterns - Warning lines matching these will be ignored
+ignore_warning:
+  - 'Debug:.*warning'
+
+# Ignore info patterns - Info lines matching these will be ignored
+ignore_info:
+  - 'Verbose:'
+
+report_patterns:
+  - name: 'status'
+    pattern: 'Error \((\d+)\).*$'
+    title_format: '{occurrence} Status: {group1}'
+    color_rules:
+      - condition: 'group1 == 0'
+        color: 'green'
+      - condition: 'True'
+        color: 'red'
+  
+  - name: 'Overview'
+    pattern: 'Result Summary.*?==='
+    subpatterns:
+      # pattern1 — applied to the main match text only
+      - pattern: '^Error \((\d+)\)'
+      # pattern2 — optional; degrades silently when absent from the match text
+      - pattern: '^Warning \((\d+)\)'
+      - pattern: '^Info \((\d+)\)'
+      - pattern: '^Resolved \((\d+)\)'
+      # pattern3 — deeper nesting example: no grandchildren needed here
+    title_format: '{occurrence}
+    \n\|Error: {pattern1.group1} 
+    \n\|Warning: {pattern2.group1}
+    \n\|Info: {pattern3.group1}
+    \n\|Resolved: {pattern4.group1}'
+    color_rules:
+      - condition: 'pattern1.group1 > 0 or pattern2.group1 > 0 or pattern3.group1 > 0 or pattern4.group1 > 0'
+        color: 'red'
+      - condition: 'True'
+        color: 'green'
+  - csv: 'status.csv'
+    cols: block_name, hier_name, error, warning, info, resolved
+    data: block_name, hier_name, pattern1.group1, pattern2.group1, pattern3.group1, pattern4.group1
