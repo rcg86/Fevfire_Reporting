@@ -82,14 +82,17 @@ def main():
     
     # Find all blocks
     if args.block_name:
-        block_dir = os.path.join(run_location, args.block_name)
-        if not os.path.isdir(block_dir):
-            print(f"ERROR: Block directory not found: {block_dir}")
-            sys.exit(1)
-        blocks = [(args.block_name, block_dir)]
+        block_names = [b.strip() for b in args.block_name.split(",") if b.strip()]
+        blocks = []
+        for bn in block_names:
+            block_dir = os.path.join(run_location, bn)
+            if not os.path.isdir(block_dir):
+                print(f"ERROR: Block directory not found: {block_dir}")
+                sys.exit(1)
+            blocks.append((bn, block_dir))
     else:
         blocks = find_all_blocks(run_location)
-    
+
     if not blocks:
         print(f"No block runs found in {run_location}")
         sys.exit(1)

@@ -1068,20 +1068,29 @@ def load_chip_hierarchy(schema_file):
 
 def find_all_blocks(run_location):
     """Find all block directories in the run location."""
+    # Directories that are never block runs regardless of content
+    SKIP_DIRS = {'gitRepo', 'logs', 'old_runs'}
+
     blocks = []
-    
-    # Look for directories that contain a block run
-    # Pattern: directories that have fv/ subdirectory or *_lec_*.log files
+
+    # Recognised signatures:
+    #   fv/              - FEV / rtl_syn run
+    #   *_lec_*.log      - LEC log (fev run)
+    #   makefile symlink - lint run (lintFire.py)
+    #   *.pending        - lint dry-run placeholder (lintFire.py --nofire)
     for item in os.listdir(run_location):
+        if item in SKIP_DIRS:
+            continue
         item_path = os.path.join(run_location, item)
         if os.path.isdir(item_path):
-            # Check if it looks like a block run directory
-            has_fv = os.path.isdir(os.path.join(item_path, 'fv'))
-            has_lec_log = bool(glob.glob(os.path.join(item_path, '*_lec_*.log')))
-            
-            if has_fv or has_lec_log:
+            has_fv       = os.path.isdir(os.path.join(item_path, 'fv'))
+            has_lec_log  = bool(glob.glob(os.path.join(item_path, '*_lec_*.log')))
+            has_makefile = os.path.islink(os.path.join(item_path, 'makefile'))
+            has_pending  = bool(glob.glob(os.path.join(item_path, '*.pending')))
+
+            if has_fv or has_lec_log or has_makefile or has_pending:
                 blocks.append((item, item_path))
-    
+
     return blocks
 
 
