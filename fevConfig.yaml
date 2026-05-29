@@ -18,6 +18,9 @@ rtl_syn:
   golden_upf_location : "/proj/work/ramapriya/UPFRelease/latest/"
   # Default block name for tag-based generation (e.g., SKYLP)
   golden_release_block: "SKYLP"
+  autoBlackBox: true
+  useILM: false
+  ILMLocation: ""
 
 rtl_rtl:
   location: "/proj/work/release/rtl"
@@ -29,6 +32,9 @@ rtl_rtl:
   golden_upf_location : "/proj/work/ramapriya/UPFRelease/latest/"
   # Default block name for tag-based generation (e.g., SKYLP_G0657)
   golden_release_block: "SKYLP"
+  autoBlackBox: true
+  useILM: false
+  ILMLocation: ""
 
 syn_pnr:
   location: "/proj/pd/rel/skylp/pnr"
@@ -39,3 +45,19 @@ syn_pnr:
   golden_upf_location : "/proj/work/ramapriya/UPFRelease/latest/"
   # Default block name for tag-based generation (e.g., SKYLP)
   golden_release_block: "SKYLP"
+  autoBlackBox: true
+  useILM: false
+  ILMLocation: ""
+
+pnr_pnr:
+  location: "/proj/pd/rel/skylp/pnr"
+  run_location: "/proj/work/ramapriya/skylp/runs/upfAutoRuns/fv/pnr_pnr_auto"
+  read_upf: false
+  # Golden releases location for tag-based flist generation
+  golden_releases_location: "/proj/rel/GOLDEN_RELEASES"
+  golden_upf_location : "/proj/work/ramapriya/UPFRelease/latest/"
+  # Default block name for tag-based generation (e.g., SKYLP)
+  golden_release_block: "SKYLP"
+  autoBlackBox: true
+  useILM: false
+  ILMLocation: ""

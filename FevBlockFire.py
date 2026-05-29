@@ -77,6 +77,7 @@ def load_config(config_path):
         'rtl_syn': cfg.get('rtl_syn', {}),
         'rtl_rtl': cfg.get('rtl_rtl', {}),
         'syn_pnr': cfg.get('syn_pnr', {}),
+        'pnr_pnr': cfg.get('pnr_pnr', {}),
         'skylp_config_data': skylp_config_data
     }
     print(f"Config loaded with default type: {default_type}")
@@ -112,6 +113,92 @@ def find_flist_for_block(block_name, skylp_config_data):
                 if block_name in sub_instances:
                     return (flist_str, wrapper_name)
     return None
+
+
+def get_autoblackbox_modules(block_name, skylp_config_data):
+    """
+    Given block_name and the parsed skylp.config.yaml, return a sorted list of
+    sibling/cousin module names that should be black-boxed when running block_name.
+
+    Algorithm:
+    - Find the wrapper (direct child of a cf_xxx entry) whose sub-instance tree
+      contains block_name.
+    - Trace the ancestor path: wrapper_instances -> ... -> block_name.
+    - Collect every module NOT on the ancestor path and NOT a descendant of
+      block_name (they are siblings/cousins that should be blackboxed).
+    - Ancestors are excluded because they are parent modules that must stay
+      transparent (e.g. running tmu_mma: tmu is ancestor -> NOT blackboxed).
+    - Descendants are excluded because they are sub-modules already contained
+      inside block_name (e.g. running tmu: tmu_mma is descendant -> NOT blackboxed).
+    - If block_name IS the wrapper itself, returns [] (nothing to blackbox).
+    """
+
+    def find_path_and_data(instances_dict, target):
+        """DFS: return (path, target_node_data) or None if not found."""
+        if not instances_dict:
+            return None
+        if target in instances_dict:
+            return ([target], instances_dict[target])
+        for mod_name, mod_data in instances_dict.items():
+            if not isinstance(mod_data, dict):
+                continue
+            result = find_path_and_data(mod_data.get('instances') or {}, target)
+            if result is not None:
+                path, data = result
+                return ([mod_name] + path, data)
+        return None
+
+    def collect_all_names(instances_dict):
+        """Recursively collect every module name in a subtree."""
+        result = []
+        for mod_name, mod_data in (instances_dict or {}).items():
+            result.append(mod_name)
+            if isinstance(mod_data, dict):
+                result.extend(collect_all_names(mod_data.get('instances') or {}))
+        return result
+
+    def collect_non_ancestors(instances_dict, ancestors_set):
+        """Recursively collect all module names that are NOT in ancestors_set."""
+        result = []
+        for mod_name, mod_data in (instances_dict or {}).items():
+            sub = mod_data.get('instances') or {} if isinstance(mod_data, dict) else {}
+            if mod_name in ancestors_set:
+                # Ancestor – keep transparent, but recurse into its children
+                result.extend(collect_non_ancestors(sub, ancestors_set))
+            else:
+                result.append(mod_name)
+                result.extend(collect_non_ancestors(sub, ancestors_set))
+        return result
+
+    top = skylp_config_data.get('skylp', {})
+    for cf_name, cf_data in top.items():
+        if not isinstance(cf_data, dict):
+            continue
+        for wrapper_name, wrapper_data in (cf_data.get('instances', {}) or {}).items():
+            if wrapper_name == block_name:
+                # Running the wrapper itself – blackbox everything inside it
+                if isinstance(wrapper_data, dict):
+                    return sorted(collect_all_names(wrapper_data.get('instances') or {}))
+                return []
+            if not isinstance(wrapper_data, dict):
+                continue
+            sub_instances = wrapper_data.get('instances') or {}
+            if not sub_instances:
+                continue
+            result = find_path_and_data(sub_instances, block_name)
+            if result is None:
+                continue
+            path, target_data = result
+            # ancestors = path nodes excluding block_name (the leaf)
+            ancestors_set = set(path[:-1])
+            # descendants of block_name are part of its own design – do not blackbox
+            descendants_set = set()
+            if isinstance(target_data, dict):
+                descendants_set = set(collect_all_names(target_data.get('instances') or {}))
+            modules = collect_non_ancestors(sub_instances, ancestors_set)
+            exclude = descendants_set | {block_name}
+            return sorted(m for m in modules if m not in exclude)
+    return []
 
 
 def find_block(base_path, block_name, location_override=None):
@@ -492,6 +579,19 @@ def run_rtl_rtl(resolved, block_path, no_exec=False, run_dir=None):
             lines.insert(1, flist_vars)
         else:
             lines.append(flist_vars)
+
+        # Inject auto black-box notranslate lines before the first read_design
+        if resolved.get('autoBlackBox') and resolved.get('skylp_config_data'):
+            bb_modules = get_autoblackbox_modules(resolved['block_name'], resolved['skylp_config_data'])
+            if bb_modules:
+                bb_block = '\n#### Auto black-box sibling modules (autoBlackBox)\n'
+                bb_block += ''.join(f'add_notranslate_modules -golden {m}\n' for m in bb_modules)
+                bb_block += '\n'
+                for i, l in enumerate(lines):
+                    if re.search(r'\bread_design\b', l):
+                        lines.insert(i, bb_block)
+                        logging.info(f"Injected auto black-box before read_design: {bb_modules}")
+                        break
         
         with open(target_do, 'w') as f:
             f.writelines(lines)
@@ -519,6 +619,62 @@ echo "Log file: {logfile_name}"
 blaunch --cpus 8 --mem 64 -L confrml:1 --jobname {jobname} --mail -L confrml launch -c cdns/confrml@25.20-w228 -- lec -nogui -lp -xl -dofile {rtl_rtl_do_name} -logfile {logfile_name} >> job_id.list
 '''
     script = generate_run_script(run_dir, resolved['block_name'], 'rtl_rtl', sh_cmds)
+    dump_info_yaml(run_dir, info)
+    if not no_exec:
+        execute_script(script)
+    else:
+        logging.info("--no_exec set: not executing script")
+
+
+def run_pnr_pnr(resolved, block_path, no_exec=False, run_dir=None):
+    logging.info("Starting pnr_pnr run")
+
+    if run_dir is None:
+        run_dir = rotate_and_create_run_dir(resolved['run_location'], resolved['block_name'])
+    else:
+        logging.info(f"Using existing run directory: {run_dir}")
+
+    info = {
+        'block_name': resolved['block_name'],
+        'run_type': 'pnr_pnr',
+        'timestamp': datetime.now().isoformat(),
+        'fv_source_location': 'NA',
+        'golden_flist': resolved.get('golden_flist') or 'NA',
+        'revised_flist': resolved.get('revised_flist') or 'NA',
+        'status': 'ok',
+        'error_detail': None,
+    }
+
+    golden_flist = resolved.get('golden_flist')
+    revised_flist = resolved.get('revised_flist')
+
+    if not golden_flist or not os.path.isfile(golden_flist):
+        logging.error(f"Golden flist not found: {golden_flist}")
+        info['status'] = 'error'
+        info['error_detail'] = f"Golden flist not found: {golden_flist}"
+        dump_info_yaml(run_dir, info)
+        sys.exit(1)
+
+    if not revised_flist or not os.path.isfile(revised_flist):
+        logging.error(f"Revised flist not found: {revised_flist}")
+        info['status'] = 'error'
+        info['error_detail'] = f"Revised flist not found: {revised_flist}"
+        dump_info_yaml(run_dir, info)
+        sys.exit(1)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    logfile_name = f"{resolved['block_name']}_lec_{timestamp}.log"
+    jobname = f"{resolved['block_name']}_auto_lec_{timestamp}"
+
+    sh_cmds = f'''cd "{run_dir}"
+echo "Running pnr_pnr for {resolved["block_name"]}"
+echo "Golden flist: {golden_flist}"
+echo "Revised flist: {revised_flist}"
+echo "Log file: {logfile_name}"
+
+blaunch --cpus 8 --mem 64 -L confrml:1 --jobname {jobname} --mail -L confrml launch -c cdns/confrml@25.20-w228 -- lec -nogui -lp -xl -logfile {logfile_name} >> job_id.list
+'''
+    script = generate_run_script(run_dir, resolved['block_name'], 'pnr_pnr', sh_cmds)
     dump_info_yaml(run_dir, info)
     if not no_exec:
         execute_script(script)
@@ -589,8 +745,26 @@ def run_rtl_syn(resolved, block_path, no_exec=False, pre_created_run_dir=False):
             read_upf = resolved.get('read_upf', True)
             golden_upf_location = resolved.get('golden_upf_location', '')
             block_name = resolved['block_name']
-            
+
+            # Compute auto black-box modules once before entering the line loop
+            bb_modules = []
+            first_read_design_injected = False
+            if resolved.get('autoBlackBox') and resolved.get('skylp_config_data'):
+                bb_modules = get_autoblackbox_modules(block_name, resolved['skylp_config_data'])
+                if bb_modules:
+                    logging.info(f"autoBlackBox enabled: will inject notranslate for: {bb_modules}")
+
             for line in lines:
+                # Inject auto black-box notranslate lines before the first read_design
+                if bb_modules and not first_read_design_injected and re.search(r'\bread_design\b', line):
+                    first_read_design_injected = True
+                    modified_lines.append('')
+                    modified_lines.append('#### Auto black-box sibling modules (autoBlackBox)')
+                    for m in bb_modules:
+                        modified_lines.append(f'add_notranslate_modules -golden {m}')
+                    modified_lines.append('')
+                    logging.info(f"Injected auto black-box notranslate lines for: {bb_modules}")
+
                 # Handle read_design command for golden with flist
                 if 'read_design' in line and '-golden' in line and resolved.get('golden_flist'):
                     # Check if line already has -f option
@@ -773,7 +947,7 @@ def run_syn_pnr(resolved, block_path, no_exec=False):
 def main():
     parser = argparse.ArgumentParser(description="FevBlockFire - launch block FEV runs")
     parser.add_argument('--block_name', required=True)
-    parser.add_argument('--type', choices=['rtl_rtl', 'rtl_syn', 'syn_pnr'])
+    parser.add_argument('--type', choices=['rtl_rtl', 'rtl_syn', 'syn_pnr', 'pnr_pnr'])
     parser.add_argument('--location', help="synthesis input path location path from where to pick the inputs for fv (overrides config)")
     parser.add_argument('--run_location', help="path where lec run gets executed (overrides config)")
     parser.add_argument('--config', help="Path to YAML config (defaults to fevConfig.yaml in fevFireRuns)")
@@ -795,7 +969,7 @@ def main():
     # Determine the run type
     run_type = args.type if args.type else config.get('type')
     
-    if run_type not in ['rtl_rtl', 'rtl_syn', 'syn_pnr']:
+    if run_type not in ['rtl_rtl', 'rtl_syn', 'syn_pnr', 'pnr_pnr']:
         print(f"ERROR: Invalid or missing run type: {run_type}")
         sys.exit(1)
     
@@ -809,7 +983,9 @@ def main():
         'run_location': args.run_location if args.run_location else type_config.get('run_location'),
         'read_upf': False if args.no_upf else type_config.get('read_upf', True),
         'rtl_rtl_do': type_config.get('rtl_rtl_do'),
-        'golden_upf_location': type_config.get('golden_upf_location', '')
+        'golden_upf_location': type_config.get('golden_upf_location', ''),
+        'autoBlackBox': type_config.get('autoBlackBox', False),
+        'skylp_config_data': config.get('skylp_config_data', {}),
     }
     
     # Change to run_location before setting up logging
@@ -829,7 +1005,7 @@ def main():
     log_file = setup_logging(args.block_name, run_type, resolved['run_location'])
     logging.info(f"Resolved config: {resolved}")
 
-    if resolved['type'] not in ['rtl_rtl', 'rtl_syn', 'syn_pnr']:
+    if resolved['type'] not in ['rtl_rtl', 'rtl_syn', 'syn_pnr', 'pnr_pnr']:
         logging.error(f"Invalid or missing run type: {resolved['type']}")
         sys.exit(1)
 
@@ -875,6 +1051,36 @@ def main():
         logging.info(f"Revised flist: {resolved_revised}")
         
         run_rtl_rtl(resolved, block_path=None, no_exec=args.no_exec, run_dir=block_dir)
+
+    elif resolved['type'] == 'pnr_pnr':
+        # pnr_pnr: golden and revised flists are direct file paths (no tag generation)
+        block_dir = os.path.join(resolved['run_location'], args.block_name)
+        if os.path.exists(block_dir):
+            old_runs = os.path.join(resolved['run_location'], "old_runs")
+            os.makedirs(old_runs, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            dest = os.path.join(old_runs, f"{args.block_name}_{ts}")
+            logging.info(f"Moving existing run dir {block_dir} -> {dest}")
+            shutil.move(block_dir, dest)
+        os.makedirs(block_dir, exist_ok=True)
+        logging.info(f"Created block directory: {block_dir}")
+        _write_refire(block_dir)
+
+        golden_flist = args.golden_flist
+        revised_flist = args.revised_flist
+
+        if not golden_flist:
+            golden_flist = input("Enter path to golden PNR flist file: ").strip()
+        if not revised_flist:
+            revised_flist = input("Enter path to revised PNR flist file: ").strip()
+
+        resolved['golden_flist'] = golden_flist
+        resolved['revised_flist'] = revised_flist
+        logging.info(f"Golden flist: {golden_flist}")
+        logging.info(f"Revised flist: {revised_flist}")
+
+        run_pnr_pnr(resolved, block_path=None, no_exec=args.no_exec, run_dir=block_dir)
+
     else:
         # For rtl_syn and syn_pnr, handle --golden_flist (file or tag) if provided
         golden_tag = args.golden_flist
