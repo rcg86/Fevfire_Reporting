@@ -292,6 +292,18 @@ def execute_script(script_path):
     logging.info("Script finished successfully")
 
 
+def execute_script_live(script_path):
+    """Run script_path without capturing stdout/stderr, so it inherits this
+    process's terminal. Needed for srun --pty --x11 (e.g. Innovus), which
+    requires an attached tty and won't produce visible output otherwise."""
+    logging.info(f"Executing script (live): {script_path}")
+    res = subprocess.run([script_path], cwd=os.path.dirname(script_path))
+    if res.returncode != 0:
+        logging.error(f"Script failed with exit code {res.returncode}")
+        sys.exit(res.returncode)
+    logging.info("Script finished successfully")
+
+
 def dump_info_yaml(run_dir, info):
     """Write info.yaml to run_dir with run metadata for later inspection."""
     info_path = os.path.join(run_dir, 'info.yaml')
@@ -626,6 +638,102 @@ blaunch --cpus 8 --mem 64 -L confrml:1 --jobname {jobname} --mail -L confrml lau
         logging.info("--no_exec set: not executing script")
 
 
+def generate_checkpoint_tcl(lec_dir):
+    """Generate lec/checkpoint.tcl, used as the -post_compare hook for write_do_lec:
+    dumps a Conformal checkpoint session if any compare points are NOT equivalent,
+    aborted, or unknown after the compare."""
+    tcl_path = os.path.join(lec_dir, 'checkpoint.tcl')
+    tcl_content = '''if {[get_compare_points -NONequivalent -count] > 0 || [get_compare_points -abort -count] > 0 || [get_compare_points -unknown -count] > 0} {
+    checkpoint debugCheckPoint -replace
+}
+'''
+    with open(tcl_path, 'w') as f:
+        f.write(tcl_content)
+    logging.info(f"Generated Conformal checkpoint.tcl: {tcl_path}")
+    return tcl_path
+
+
+def generate_dump_lec_data_tcl(lec_dir, golden_db, revised_db):
+    """Generate the Innovus tcl file that dumps golden/revised netlists+UPF
+    from the two PNR databases and writes the LEC do file. Only used for pnr_pnr."""
+    generate_checkpoint_tcl(lec_dir)
+    tcl_path = os.path.join(lec_dir, 'dump_lec_data.tcl')
+    tcl_content = f'''file mkdir lec/golden
+file mkdir lec/revised
+
+read_db {golden_db} -no_tim
+write_netlist lec/golden/golden.v
+write_power_intent -1801 lec/golden/golden.upf
+
+set_db read_db_stop_at_design_in_memory false
+read_db {revised_db} -no_tim
+write_netlist lec/revised/revised.v
+write_power_intent -1801 lec/revised/revised.upf
+
+write_do_lec lec_files -1801_golden lec/golden/golden.upf -1801_revised lec/revised/revised.upf -verbose -golden_design lec/golden/golden.v -flat -revised_design lec/revised/revised.v -verbose -write_session lec_completed.session -post_compare lec/checkpoint.tcl
+
+exit
+'''
+    with open(tcl_path, 'w') as f:
+        f.write(tcl_content)
+    logging.info(f"Generated Innovus dump_lec_data.tcl: {tcl_path}")
+    return tcl_path
+
+
+def generate_lec_data_sh(lec_dir, run_dir, block_name):
+    """Generate lec/generate_lec_data.sh which launches Innovus (via srun) on
+    dump_lec_data.tcl to dump golden/revised netlists+UPF and the LEC do file.
+    Runs from run_dir since dump_lec_data.tcl uses lec/... relative paths."""
+    sh_path = os.path.join(lec_dir, 'generate_lec_data.sh')
+    content = f'''#!/bin/bash
+# Generated for {block_name} pnr_pnr (Innovus dump_lec_data) at {datetime.now().isoformat()}
+
+cd "{run_dir}"
+
+srun --time=18:00:00 \\
+     --job-name=lec_gen_data \\
+     --ntasks=1 \\
+     --partition=od-64-gb-4-cores \\
+ -L innovus \\
+     --pty \\
+     --x11 \\
+     bash -c "launch -c cdns/innovus -- innovus -stylus -files lec/dump_lec_data.tcl"
+'''
+    with open(sh_path, 'w') as f:
+        f.write(content)
+    os.chmod(sh_path, 0o755)
+    logging.info(f"Generated Innovus launch script: {sh_path}")
+    return sh_path
+
+
+def generate_lec_run_sh(run_dir, block_name):
+    """Generate run_lec_pnr_pnr.sh which launches Conformal (lec) using the
+    do file at ./fv/invs/<block_name>/lec_files (relative to run_dir)."""
+    sh_path = os.path.join(run_dir, 'run_lec_pnr_pnr.sh')
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    logfile_name = f"{block_name}_lec_{timestamp}.log"
+    jobname = f"{block_name}_auto_lec_{timestamp}"
+    dofile = f"./fv/invs/{block_name}/lec_files"
+    content = f'''#!/bin/bash
+# Generated for {block_name} pnr_pnr (Conformal lec) at {datetime.now().isoformat()}
+
+cd "{run_dir}"
+echo "Running pnr_pnr lec for {block_name}"
+echo "Dofile: {dofile}"
+echo "Log file: {logfile_name}"
+
+blaunch --cpus 8 --mem 64 -L confrml:1 --jobname {jobname} --mail -L confrml launch -c cdns/confrml@25.20-w228 -- lec -nogui -lp -xl -dofile {dofile} -logfile {logfile_name} >> job_id.list
+
+sleep 10
+squeue -u $(whoami)
+'''
+    with open(sh_path, 'w') as f:
+        f.write(content)
+    os.chmod(sh_path, 0o755)
+    logging.info(f"Generated Conformal launch script: {sh_path}")
+    return sh_path
+
+
 def run_pnr_pnr(resolved, block_path, no_exec=False, run_dir=None):
     logging.info("Starting pnr_pnr run")
 
@@ -639,47 +747,42 @@ def run_pnr_pnr(resolved, block_path, no_exec=False, run_dir=None):
         'run_type': 'pnr_pnr',
         'timestamp': datetime.now().isoformat(),
         'fv_source_location': 'NA',
-        'golden_flist': resolved.get('golden_flist') or 'NA',
-        'revised_flist': resolved.get('revised_flist') or 'NA',
+        'golden_db': resolved.get('golden_db') or 'NA',
+        'revised_db': resolved.get('revised_db') or 'NA',
         'status': 'ok',
         'error_detail': None,
     }
 
-    golden_flist = resolved.get('golden_flist')
-    revised_flist = resolved.get('revised_flist')
+    golden_db = resolved.get('golden_db')
+    revised_db = resolved.get('revised_db')
 
-    if not golden_flist or not os.path.isfile(golden_flist):
-        logging.error(f"Golden flist not found: {golden_flist}")
+    if not golden_db or not os.path.exists(golden_db):
+        logging.error(f"Golden db not found: {golden_db}")
         info['status'] = 'error'
-        info['error_detail'] = f"Golden flist not found: {golden_flist}"
+        info['error_detail'] = f"Golden db not found: {golden_db}"
         dump_info_yaml(run_dir, info)
         sys.exit(1)
 
-    if not revised_flist or not os.path.isfile(revised_flist):
-        logging.error(f"Revised flist not found: {revised_flist}")
+    if not revised_db or not os.path.exists(revised_db):
+        logging.error(f"Revised db not found: {revised_db}")
         info['status'] = 'error'
-        info['error_detail'] = f"Revised flist not found: {revised_flist}"
+        info['error_detail'] = f"Revised db not found: {revised_db}"
         dump_info_yaml(run_dir, info)
         sys.exit(1)
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    logfile_name = f"{resolved['block_name']}_lec_{timestamp}.log"
-    jobname = f"{resolved['block_name']}_auto_lec_{timestamp}"
+    lec_dir = os.path.join(run_dir, 'lec')
+    os.makedirs(lec_dir, exist_ok=True)
+    dump_lec_data_tcl = generate_dump_lec_data_tcl(lec_dir, golden_db, revised_db)
+    gen_lec_data_script = generate_lec_data_sh(lec_dir, run_dir, resolved['block_name'])
+    lec_run_script = generate_lec_run_sh(run_dir, resolved['block_name'])
 
-    sh_cmds = f'''cd "{run_dir}"
-echo "Running pnr_pnr for {resolved["block_name"]}"
-echo "Golden flist: {golden_flist}"
-echo "Revised flist: {revised_flist}"
-echo "Log file: {logfile_name}"
-
-blaunch --cpus 8 --mem 64 -L confrml:1 --jobname {jobname} --mail -L confrml launch -c cdns/confrml@25.20-w228 -- lec -nogui -lp -xl -logfile {logfile_name} >> job_id.list
-'''
-    script = generate_run_script(run_dir, resolved['block_name'], 'pnr_pnr', sh_cmds)
     dump_info_yaml(run_dir, info)
+
     if not no_exec:
-        execute_script(script)
+        execute_script_live(gen_lec_data_script)
+        execute_script(lec_run_script)
     else:
-        logging.info("--no_exec set: not executing script")
+        logging.info("--no_exec set: not executing generate_lec_data.sh or run_lec_pnr_pnr.sh")
 
 
 def run_rtl_syn(resolved, block_path, no_exec=False, pre_created_run_dir=False):
@@ -945,6 +1048,7 @@ def run_syn_pnr(resolved, block_path, no_exec=False):
 
 
 def main():
+    invocation_cwd = os.getcwd()
     parser = argparse.ArgumentParser(description="FevBlockFire - launch block FEV runs")
     parser.add_argument('--block_name', required=True)
     parser.add_argument('--type', choices=['rtl_rtl', 'rtl_syn', 'syn_pnr', 'pnr_pnr'])
@@ -955,6 +1059,8 @@ def main():
     parser.add_argument('--no_upf', action='store_true', help='Comment out read_power_intent commands in the do file (applies to all run types)')
     parser.add_argument('--golden_flist', type=str, help='Golden flist file path or tag (e.g., SKYLP_G0550). Applies to rtl_rtl, rtl_syn, syn_pnr')
     parser.add_argument('--revised_flist', type=str, help='Revised flist file path or tag (rtl_rtl only)')
+    parser.add_argument('--golden_db', type=str, help='Golden PNR design database absolute path (required for pnr_pnr)')
+    parser.add_argument('--revised_db', type=str, help='Revised PNR design database absolute path (required for pnr_pnr)')
     args = parser.parse_args()
 
     # config default path
@@ -1053,7 +1159,22 @@ def main():
         run_rtl_rtl(resolved, block_path=None, no_exec=args.no_exec, run_dir=block_dir)
 
     elif resolved['type'] == 'pnr_pnr':
-        # pnr_pnr: golden and revised flists are direct file paths (no tag generation)
+        # pnr_pnr: driven by golden/revised PNR databases (no flists needed)
+        if not args.golden_db or not args.revised_db:
+            logging.error("--golden_db and --revised_db are required for pnr_pnr type")
+            print("ERROR: --golden_db and --revised_db are required for pnr_pnr type")
+            sys.exit(1)
+
+        resolved_dbs = {}
+        for label, key, db_path in (('--golden_db', 'golden_db', args.golden_db), ('--revised_db', 'revised_db', args.revised_db)):
+            abs_db_path = db_path if os.path.isabs(db_path) else os.path.normpath(os.path.join(invocation_cwd, db_path))
+            if not os.path.exists(abs_db_path):
+                logging.error(f"{label} not found: {abs_db_path}")
+                print(f"ERROR: {label} not found: {abs_db_path}")
+                sys.exit(1)
+            resolved_dbs[key] = abs_db_path
+            logging.info(f"Resolved {label}: {db_path} -> {abs_db_path}")
+
         block_dir = os.path.join(resolved['run_location'], args.block_name)
         if os.path.exists(block_dir):
             old_runs = os.path.join(resolved['run_location'], "old_runs")
@@ -1066,18 +1187,10 @@ def main():
         logging.info(f"Created block directory: {block_dir}")
         _write_refire(block_dir)
 
-        golden_flist = args.golden_flist
-        revised_flist = args.revised_flist
-
-        if not golden_flist:
-            golden_flist = input("Enter path to golden PNR flist file: ").strip()
-        if not revised_flist:
-            revised_flist = input("Enter path to revised PNR flist file: ").strip()
-
-        resolved['golden_flist'] = golden_flist
-        resolved['revised_flist'] = revised_flist
-        logging.info(f"Golden flist: {golden_flist}")
-        logging.info(f"Revised flist: {revised_flist}")
+        resolved['golden_db'] = resolved_dbs['golden_db']
+        resolved['revised_db'] = resolved_dbs['revised_db']
+        logging.info(f"Golden db: {resolved['golden_db']}")
+        logging.info(f"Revised db: {resolved['revised_db']}")
 
         run_pnr_pnr(resolved, block_path=None, no_exec=args.no_exec, run_dir=block_dir)
 
